@@ -1,0 +1,2790 @@
+///$tab SETUP
+IF DocumentName() like '@{UAT_Consents_Id}' then
+    SET vBaseConnection = 'lib://OmniA_UAT/';
+    SET vBaseConnection_Conf = 'lib://OmniA_UAT_CONFI/';
+    SET vBaseConnection_HA = 'lib://HA_OneOmniA_UAT/';
+    SET vBaseConnection_Conf_HA = 'lib://HA_OneOmniA_UAT_CONFI/';
+ELSE
+    SET vBaseConnection = 'lib://OmniA/';
+    SET vBaseConnection_Conf = 'lib://OmniA_Confi/';
+    SET vBaseConnection_HA = 'lib://HA_OneOmniA/';
+    SET vBaseConnection_Conf_HA = 'lib://HA_OneOmniA_CONFI/';
+ENDIF;
+
+SET vAppName = 'Standard'; // Used for remove fields
+
+Let vPath_Scripts = vBaseConnection_HA & '03_Common\Includes\';
+
+Trace $(vPath_Scripts);
+
+$(must_include=[$(vPath_Scripts)TRA_Folder_Structure_Conf.txt]);
+$(must_include=[$(vPath_Scripts)TRA_Folder_Structure_NonConf.txt]);
+$(must_include=[$(vPath_Scripts)MSMART_SP_Variables.txt]);
+ 
+//LET vLoadFolder = vPath_Transform & '2_OneOmnia_OmniA\';
+
+LET vPreLoadFolder = vBaseConnection_Conf&'02_Datastore/03_DataModel/Global_without_autonumber/';
+LET vLoadFolder = vBaseConnection_Conf&'02_Datastore/03_DataModel/Global/OneOmniA/';
+LET vPreLoadFolderHA = vBaseConnection_Conf_HA&'QlikMart/QM_Integration_Layer/';
+LET vFolder_Input_SharePoint = vBaseConnection_Conf_HA&'01_Datastore/01_Extract/SharePoint';
+
+//TODO: Move these variables to SharePoint
+SET vRegion_Drill_Down = '=if(GetSelectedCount(Region)=0 ,''Region'',
+  if(GetSelectedCount(Region)>0 and GetSelectedCount([Subregion 1])=0,''[Subregion 1]'',
+    if(GetSelectedCount([Subregion 1])>0 and GetSelectedCount([Subregion 2])=0,''[Subregion 2]'',
+      if(GetSelectedCount([Subregion 2])>0 and GetSelectedCount([Subregion 3])=0,''[Subregion 3]'',
+        if(GetSelectedCount([Subregion 3])>0 and GetSelectedCount([Subregion 4])=0,''[Subregion 4]'')
+      )
+    )
+  )
+)';
+SET vFocus_Dimension_Consent_Coverage = Digital Segmentation;
+
+let vHistYear = Year(today())-2;
+///$tab Main
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$#.##0,00;-$#.##0,00';
+SET TimeFormat='hh:mm:ss TT';
+SET DateFormat='DD/MM/YYYY';
+SET TimestampFormat='DD/MM/YYYY hh:mm:ss[.fff] TT';
+SET FirstWeekDay=0;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+SET CreateSearchIndexOnReload=0;
+///$tab Inline Table
+Time_Period:
+Load * Inline
+[
+Time,
+'YTD',
+'Full Period',
+'Last 12 Months',
+'Last 3 Months'
+'Last Year',
+'Previous Month YTD'
+];
+
+Fact_Function:
+Load * Inline
+[
+FactFunction,
+'Commercial',
+'Medical'
+];
+///$tab Procedures
+Trace DEBUG SECTION: Procedures;
+SUB ReaggrProcedure(pRPSrcQVD,pRPProcessedQVD,pRPMainKey,pRPFieldList,pRPKeyName,pRPExecute,pRPMapName,pRPDebug)
+
+    LET vRP__Execute = alt(pRPExecute,1);
+    
+    For vRP__Control = 1 to 1
+    
+        [__RP.fields]:
+        Load [__field], 1 as [__required] Inline [
+            __field
+    $(pRPFieldList)
+        ];
+
+        LET vRP__Check = NoOfRows('__RP.fields');
+
+        if alt(vRP__Check,0) = 0 then
+
+            Trace ReaggrProcedure->Error: FieldList should be added in a style for the furhter INLINE load and is mandatory;
+            SET TriggerError;
+
+        	Exit For;
+
+        EndIf;
+
+        LET vRP__NoOfFields = QvdNoOfFields(pRPSrcQVD);
+
+        if alt(vRP__NoOfFields,0) = 0 then
+
+            Trace ReaggrProcedure->Error: QVD contains no fields or no QVD exist within the provided path;
+            SET TriggerError;
+            Exit For;
+
+        EndIf;
+
+        if not IsNull(TableNumber('__RP.fields2')) then 
+            Drop Table [__RP.fields2];
+        endif;
+        
+        [__RP.fields2]:
+        NoConcatenate
+        Load
+            null() as [__field]
+            ,1 as [__available]
+        AutoGenerate(0);
+
+        Concatenate([__RP.fields2])
+        Load
+            QvdFieldName('$(pRPSrcQVD)',RowNo()) as [__field]
+            ,1 as [__available]
+        AutoGenerate($(vRP__NoOfFields));
+
+        outer join([__RP.fields])
+        Load * Resident [__RP.fields2];
+
+        if not IsNull(TableNumber('__RP.fields2')) then 
+            Drop Table [__RP.fields2];
+        endif;
+        
+        LET vRP__t.Table = replace(if(isnull(TableNumber('__RP.fields.t')),'[{TBL}]: NoConcatenate','Concatenate([{TBL}])'),'{TBL}',pLVQ_Table);
+        
+        [__RP.fields.t]:
+        Load
+             Concat(Distinct replace('[%fld%]','%fld%',[__field]),',') as [__fields]
+            ,Concat(Distinct replace('[%fld%]','%fld%',[__field]),'&''|''&') as [__fields.newKey]
+            ,'$(pRPKeyName)' as [__fields.newKeyName]
+        Resident [__RP.fields]
+        Where alt([__available],0)=1 and alt([__required],0)=1;
+
+        LET vRP__fields = peek('__fields',-1,'__RP.fields.t');
+        LET vRP__newKey = peek('__fields.newKey',-1,'__RP.fields.t');
+
+        if alt(len(vRP__fields),0) = 0 then
+
+            Trace ReaggrProcedure->Error: QVD contains no required fields;
+            SET TriggerError;
+            Exit For;
+
+        EndIf;
+
+        LET vRP__Table = replace(if(isnull(TableNumber('__RP.table')),'[{TBL}]: NoConcatenate','Concatenate([{TBL}])'),'{TBL}','__RP.table');
+        
+        $(vRP__Table)
+        Load
+        	replace(replace('Concat(distinct {NEWKEY},''@'',{NEWKEY}) as [{NEWKEYNAME}]','{NEWKEY}',[__fields.newKey]),'{NEWKEYNAME}',[__fields.newKeyName]) as [__table.newKey]
+        	,replace(replace('tag fields {NEWKEYFIELDS},[{NEWKEYNAME}] with ''${NEWKEYNAME}''','{NEWKEYFIELDS}',[__fields]),'{NEWKEYNAME}',[__fields.newKeyName]) as [__table.newTag]
+            ,replace('IF FieldNumber(''{NEWKEYNAME}'',''__RP.src'')>0 then'&chr(10)&'Drop Field [{NEWKEYNAME}] from [__RP.src];'&chr(10)&'endif','{NEWKEYNAME}',[__fields.newKeyName]) as [__table.drops]
+            ,replace('IF FieldNumber(''__TMP_{NEWKEYNAME}'',''__RP.src'')>0 then'&chr(10)&'Drop Field [__TMP_{NEWKEYNAME}] from [__RP.src];'&chr(10)&'endif','{NEWKEYNAME}',[__fields.newKeyName]) as [__table.TMP_drops]
+        Resident [__RP.fields.t];
+        
+        if not len(Coalesce(pRPMapName,''))=0 then
+            LET vRP__MapsTable = replace(if(isnull(TableNumber('__RP.Mapstable')),'[{TBL}]: NoConcatenate','Concatenate([{TBL}])'),'{TBL}','__RP.Mapstable');
+
+            $(vRP__MapsTable)
+            Load
+                '$(pRPMainKey)' as [__map.firstKeyName]
+                ,'$(pRPKeyName)' as [__map.secondKeyName]
+                ,'$(pRPMapName)' as [__map.Name]
+            AutoGenerate(1);
+        EndIf;
+
+        if vRP__Execute = 1 then
+        
+            [__RP.table.agg]:
+            Load
+            	concat([__table.newKey],','&chr(10)) as [__table.agg.newKeys]
+            	,concat([__table.newTag],';'&chr(10)) as [__table.agg.newTags]
+            	,concat([__table.drops],';'&chr(10)) as [__table.agg.drops]
+            	,concat([__table.TMP_drops],';'&chr(10)) as [__table.agg.TMP_drops]
+            Resident [__RP.table];
+
+            LET vRP__newKeys = peek('__table.agg.newKeys',-1,'__RP.table.agg');
+            LET vRP__newTags = peek('__table.agg.newTags',-1,'__RP.table.agg');
+            LET vRP__drops = peek('__table.agg.drops',-1,'__RP.table.agg');
+            LET vRP__TMP_drops = peek('__table.agg.TMP_drops',-1,'__RP.table.agg');
+
+            [__RP.src]:
+            NoConcatenate
+            LOAD
+                 *
+            from '$(pRPSrcQVD)' (qvd);
+
+            $(vRP__drops);
+
+            Left join ([__RP.src])
+                Load
+                    [$(pRPMainKey)]
+                    ,$(vRP__newKeys)
+                Resident [__RP.src]
+                Group by [$(pRPMainKey)];
+
+            $(vRP__TMP_drops);
+            
+        endif;
+        
+    Next vRP__Control;
+
+    if not IsNull(TableNumber('__RP.fields')) then 
+    	Drop Table [__RP.fields];
+    endif;
+    if not IsNull(TableNumber('__RP.fields.t')) then 
+    	Drop Table [__RP.fields.t];
+    endif;
+    
+    if not IsNull(TableNumber('__RP.src')) then 
+        $(vRP__newTags);
+        Store [__RP.src] into '$(pRPProcessedQVD)' (qvd);
+        
+        if not isnull(TableNumber('__RP.Mapstable')) then
+
+            [__RP.Mapstable.agg]:
+            Load
+            concat(replace(replace(replace('[m{MAPNAME}]:'&chr(10)&'MAPPING LOAD'&chr(10)&'[{FIRSTKEY}]'&chr(10)&',[{SECONDKEY}]'&chr(10)&'resident [__RP.src]','{MAPNAME}',[__map.Name]),'{FIRSTKEY}',[__map.firstKeyName]),'{SECONDKEY}',[__map.secondKeyName]),';'&chr(10)) as [__map.agg.maps]
+            Resident [__RP.Mapstable];
+        
+        	LET vRP__Maps = peek('__map.agg.maps',-1,'__RP.Mapstable.agg');
+            $(vRP__Maps);
+        
+            Drop Table [__RP.Mapstable];
+        
+        EndIf;
+        
+        Drop Table [__RP.src];
+        if not IsNull(TableNumber('__RP.table')) then 
+            Drop Table [__RP.table];
+        endif;
+        if not IsNull(TableNumber('__RP.table.agg')) then 
+            Drop Table [__RP.table.agg];
+        endif;
+    endif;
+
+    LET vRP__fields = Null();
+    LET vRP__newKey = Null();
+    LET vRP__Control = Null();
+    LET vRP__Check = Null();
+    LET vRP__NoOfFields = Null();
+    LET vRP__Execute = Null();
+    LET vRP__Table = Null();
+    LET vRP__newKeys = Null();
+    LET vRP__newTags = Null();
+    LET vRP__drops = Null();
+    LET vRP__TMP_drops = Null();
+    LET vRP__MapsTable = Null();
+    LET vRP__Maps = Null();
+
+End sub;
+
+SUB LoadVerifyQVD(pLVQ_Table,pLVQ_QVD,pLVQ_FieldList,pLVQ_PrecedingLoad,pLVQ_WhereClause,pLVQ_Distinct)
+
+	//Store system ErrorMode
+    LET vLVQ_ErrorMode = ErrorMode;
+    SET ErrorMode = 0;
+    LET vLVQ_Check = Null();
+    LET vLVQ_Distinct = if(alt(pLVQ_Distinct,0),'Distinct','');
+    
+    //Adding controling loop to properly clean all temporary variables and tables on exit
+    For vLVQ_Control = 1 to 1
+    
+        let vLVQ_NoOfFields = QvdNoOfFields(pLVQ_QVD);
+
+        if alt(vLVQ_NoOfFields,0) = 0 then
+        	
+            Trace LoadVerifyQVD->Error: QVD contains no fields or no QVD exist within the provided path;
+            LET ErrorMode = vLVQ_ErrorMode;
+            SET TriggerError;
+            Exit For;
+        
+        EndIf;
+		
+    	if pLVQ_FieldList like '$*' then
+        	
+            tLVQ_ttags:
+            LOAD
+                String%Table,
+                %Key_QvdFieldHeader_59D66ED49CFF179D
+            FROM [$(pLVQ_QVD)]
+            (XmlSimple, table is [QvdTableHeader/Fields/QvdFieldHeader/Tags/String]);
+
+            tLVQ_tfields:
+            LOAD
+                "FieldName",
+                BitOffset,
+                BitWidth,
+                Bias,
+                NoOfSymbols,
+                Offset,
+                "Length",
+                "NumberFormat/Type",
+                "NumberFormat/nDec",
+                "NumberFormat/UseThou",
+                "NumberFormat/Fmt",
+                "NumberFormat/Dec",
+                "NumberFormat/Thou",
+                %Key_QvdTableHeader_B94FCCAC68ED3E20,
+                %Key_QvdFieldHeader_59D66ED49CFF179D
+            FROM [$(pLVQ_QVD)]
+            (XmlSimple, table is [QvdTableHeader/Fields/QvdFieldHeader]);
+            
+            Inner Join (tLVQ_tfields)
+            Load Distinct
+            	%Key_QvdFieldHeader_59D66ED49CFF179D
+            Resident tLVQ_ttags
+            where [String%Table]='$(pLVQ_FieldList)';
+            
+            tLVQ_tt:
+            NoConcatenate
+            Load distinct [FieldName] as tLVQ_ttField, 1 as tLVQ_tt 
+            resident tLVQ_tfields;
+
+            LET vLVQ_Check = NoOfRows('tLVQ_tt');
+
+            if alt(vLVQ_Check,0) = 0 then
+
+                Trace LoadVerifyQVD->Error: If FieldList starts with '$' - it should contain valid field tag;
+                LET ErrorMode = vLVQ_ErrorMode;
+                SET TriggerError;
+                Exit For;
+
+            EndIf;
+            
+            drop table [tLVQ_ttags];
+            drop table [tLVQ_tfields];
+        
+        else
+        
+            Drop Table tLVQ_tt;
+
+            tLVQ_tt:
+            NoConcatenate
+            Load distinct *, 1 as tLVQ_tt Inline
+            [
+            tLVQ_ttField
+            $(pLVQ_FieldList)
+            ];
+
+            LET vLVQ_Check = NoOfRows('tLVQ_tt');
+
+            if alt(vLVQ_Check,0) = 0 then
+
+                Trace LoadVerifyQVD->Error: FieldList should be added in a style for the furhter INLINE load and is mandatory;
+                LET ErrorMode = vLVQ_ErrorMode;
+                SET TriggerError;
+                Exit For;
+
+            EndIf;
+
+        EndIf;
+
+		Drop Table tLVQ_tt2;
+        tLVQ_tt2:
+        NoConcatenate
+        Load
+            null() as tLVQ_ttField
+            ,1 as tLVQ_tt2
+        AutoGenerate(0);
+
+        Concatenate(tLVQ_tt2)
+        Load
+        QvdFieldName('$(pLVQ_QVD)',RowNo()) as tLVQ_ttField
+        ,1 as tLVQ_tt2
+        AutoGenerate($(vLVQ_NoOfFields));
+
+        outer join(tLVQ_tt)
+        Load * Resident tLVQ_tt2;
+
+        drop Table tLVQ_tt2;
+        
+        Drop Table tLVQ_tt2;
+        tLVQ_tt2:
+        NoConcatenate
+        Load
+        null() as tLVQ_ttField
+        ,1 as tLVQ_tt3
+        AutoGenerate(0);
+
+        if not isnull(TableNumber(pLVQ_Table)) then
+        	
+            let vLVQ_NoOfFields = NoOfFields(pLVQ_Table);
+            
+            Concatenate(tLVQ_tt2)
+            Load
+            FieldName(RowNo(),'pLVQ_Table') as tLVQ_ttField
+            ,1 as tLVQ_tt3
+            AutoGenerate($(vLVQ_NoOfFields));
+            
+        endif;
+
+        outer join(tLVQ_tt)
+        Load * Resident tLVQ_tt2;
+
+        drop Table tLVQ_tt2;
+
+        LET vLVQ_PrecedingLoad = '';
+        IF not coalesce(pLVQ_PrecedingLoad,'')='' then
+        
+        	LET vLVQ_PrecedingLoad = 'LOAD '&vLVQ_Distinct&chr(10)&pLVQ_PrecedingLoad&chr(10)&';'&chr(10)&'LOAD * Resident tLVQ_tt3';
+        
+        EndIf;
+        
+        LET vLVQ_Check = if(vLVQ_PrecedingLoad = '',1,0);
+        
+        tLVQ_tt2:
+        NoConcatenate
+        Load
+            concat(replace(if(isnull(tLVQ_tt2),null(),'[{FLD}]'),'{FLD}',tLVQ_ttField),chr(10)&'	,') as tLVQ_ttFields
+            ,concat(replace(if(isnull(tLVQ_tt2),if($(vLVQ_Check)=1,null(),'null() as [{FLD}]'),null()),'{FLD}',tLVQ_ttField),chr(10)&'	,') as tLVQ_ttAbsentFields
+            ,concat(replace(if($(vLVQ_Check)=0,null(),'null() as [{FLD}]'),'{FLD}',tLVQ_ttField),chr(10)&'	,') as tLVQ_ttNullFields
+        Resident tLVQ_tt
+        where tLVQ_tt=1;
+
+        let vLVQ_AbsentFieldList = Peek('tLVQ_ttAbsentFields',-1,'tLVQ_tt2');
+        let vLVQ_FieldList = Peek('tLVQ_ttFields',-1,'tLVQ_tt2');
+        let vLVQ_NullFieldList = Peek('tLVQ_ttNullFields',-1,'tLVQ_tt2');
+        
+        LET vLVQ_Table = replace(if(isnull(TableNumber(pLVQ_Table)),'[{TBL}]: NoConcatenate','Concatenate([{TBL}])'),'{TBL}',pLVQ_Table);
+
+        LET vLVQ_WhereClause = '';
+        IF not coalesce(pLVQ_WhereClause,'')='' then
+        
+        	LET vLVQ_WhereClause = 'WHERE'&chr(10)&pLVQ_WhereClause;
+        
+        EndIf;
+
+        LET vLVQ_Exec = if(vLVQ_Check = 1
+        	,vLVQ_Table&chr(10)&
+            'LOAD '&vLVQ_Distinct&chr(10)&
+            vLVQ_FieldList&chr(10)&
+            'FROM ['&pLVQ_QVD&'] (qvd)'&chr(10)&
+            vLVQ_WhereClause&chr(10)&
+            vLVQ_OrderBy&chr(10)&
+            ';'
+            
+            ,'tLVQ_tt3:'&chr(10)&
+            'NoConcatenate'&chr(10)&
+            'LOAD '&vLVQ_Distinct&chr(10)&
+            vLVQ_FieldList&chr(10)&
+            'FROM ['&pLVQ_QVD&'] (qvd)'&chr(10)&
+            vLVQ_WhereClause&chr(10)&
+            ';'&chr(10)&chr(10)&
+            
+            if(len(vLVQ_AbsentFieldList)>0
+              ,'concatenate(tLVQ_tt3)'&chr(10)&
+              'LOAD '&chr(10)&
+              vLVQ_AbsentFieldList&chr(10)&
+              'autogenerate(0);'&chr(10)&chr(10)
+              ,'')&
+            
+            vLVQ_Table&chr(10)&
+            vLVQ_PrecedingLoad&chr(10)&
+            ';');
+        
+        let vDebugTrace = Replace(vLVQ_Exec,';','|||||');
+        TRACE $(vDebugTrace);
+        let vDebugTrace = null();
+        
+        $(vLVQ_Exec)
+
+	Next vLVQ_Control;
+
+	Drop Table tLVQ_tt;
+	Drop Table tLVQ_tt2;
+	Drop Table tLVQ_tt3;
+
+    LET ErrorMode = vLVQ_ErrorMode;
+    LET vLVQ_Control = Null();
+    LET vLVQ_Check = Null();
+    LET vLVQ_NoOfFields = Null();
+    LET vLVQ_i = Null();
+    LET vLVQ_ttField = Null();
+    LET vLVQ_FieldList = Null();
+    LET vLVQ_NullFieldList = Null();
+    LET vLVQ_PrecedingLoad = Null();
+    LET vLVQ_Table = Null();
+    LET vLVQ_WhereClause = Null();
+    LET vLVQ_Distinct = Null();
+    LET vLVQ_Exec = Null();
+    
+End Sub;
+
+Sub LoadMapping(pLM__KeyName,pLM__QVD,pLM__SecondKeyName,pLM__MapName,pLM__WhereClause)
+
+	LET vLM__KeyName = if(pLM__KeyName like '%*',mid(pLM__KeyName,2,len(pLM__KeyName)-1),pLM__KeyName);
+    LET vLM__SecondKeyName = coalesce(pLM__SecondKeyName, pLM__KeyName&'_OmniA');
+    LET vLM__MapName = coalesce(pLM__MapName,vLM__KeyName);
+    LET vLM__WhereClause = if(alt(len(pLM__WhereClause),0)=0,'','WHERE '&pLM__WhereClause);
+    
+    [t$(vLM__KeyName)]:
+    NoConcatenate
+    Load Distinct
+         [%$(vLM__KeyName)]
+        ,[$(vLM__SecondKeyName)]
+    from '$(pLM__QVD)' (qvd)
+    $(vLM__WhereClause);
+
+    [m$(vLM__MapName)]:
+    MAPPING LOAD
+         [%$(vLM__KeyName)]
+        ,[$(vLM__SecondKeyName)]
+    resident [t$(vLM__KeyName)];
+
+    DROP Table [t$(vLM__KeyName)];
+    
+    LET vLM__KeyName = Null();
+    LET vLM__SecondKeyName = Null();
+    LET vLM__MapName = Null();
+    LET vLM__WhereClause = Null();
+
+End Sub;
+///$tab Formulas
+Metric:
+Load
+	0 as Formula_VariableName
+AutoGenerate(0);    
+
+
+Concatenate(Metric)
+LOAD
+    Formula_VariableName,
+    Formula,
+    'KPI Label'
+FROM [lib://HA_OneOmniA_UAT/01_Datastore/01_Extract/SharePoint/Configuration/Local_Formulas - OneOmniA__TAB_Formulas.qvd]
+(qvd) where Omnia=1
+and not IsNull(Formula_VariableName) 
+and Formula_VariableName <> ''
+and not Exists(Formula_VariableName)
+;
+
+// Iterate each row in the table and create a variable for it
+LET vNumberOfRows = NoOfRows('Metric');
+
+FOR vI = 0 to (vNumberOfRows - 1)
+	
+    Let vVariable_Name = Peek('Formula_VariableName',vI,'Metric');
+	Let [$(vVariable_Name)] = Peek('Formula',vI,'Metric');
+	Let [$(vVariable_Name)_Label] = Peek('KPI Label',vI,'Metric');
+    
+NEXT
+
+Drop Table Metric;
+
+// Load Metrics into table
+Metric:
+Load
+	0 as Formula_VariableName
+AutoGenerate(0);    
+
+Concatenate(Metric)
+LOAD
+    Formula_VariableName,
+    Formula,
+    Omnia
+FROM [$(vBaseConnection_Conf_HA)01_Datastore/01_Extract/SharePoint/Configuration/Local_Formulas - OneOmniA__TAB_Auxiliary_Variables.qvd]
+(qvd) where Omnia=1 
+and not IsNull(Formula_VariableName) 
+and Formula_VariableName <> ''
+and not Exists(Formula_VariableName)
+;
+
+// Iterate each row in the table and create a variable for it
+LET vNumberOfRows = NoOfRows('Metric');
+
+FOR vI = 0 to (vNumberOfRows - 1)
+	
+    Let vVariable_Name = Peek('Formula_VariableName',vI,'Metric');
+	Let [$(vVariable_Name)] = Peek('Formula',vI,'Metric');
+    
+NEXT
+
+Drop Table Metric;
+
+
+
+// Load Labels into table
+
+if(FileSize('$(vBaseConnection_Conf_HA)01_Datastore/01_Extract/SharePoint/Configuration/Labels - OneOmniA__TAB_Labels.qvd')>0) then
+Metric:
+Load
+	0 as Formula_VariableName
+AutoGenerate(0);    
+
+Concatenate(Metric)
+LOAD
+    Formula_VariableName,
+    Formula,
+    Omnia
+FROM [$(vBaseConnection_Conf_HA)01_Datastore/01_Extract/SharePoint/Configuration/Labels - OneOmniA__TAB_Labels.qvd]
+(qvd) where Omnia=1 
+and not IsNull(Formula_VariableName) 
+and Formula_VariableName <> ''
+and not Exists(Formula_VariableName)
+;
+
+
+// Iterate each row in the table and create a variable for it
+LET vNumberOfRows = NoOfRows('Metric');
+
+FOR vI = 0 to (vNumberOfRows - 1)
+	
+    Let vVariable_Name = Peek('Formula_VariableName',vI,'Metric');
+	Let [$(vVariable_Name)] = Peek('Formula',vI,'Metric');
+    
+NEXT
+
+Drop Table Metric;
+
+end if;
+
+Permissions:
+Load * Inline
+[
+Permissions,
+'My country(s)',
+'All countries'
+];
+
+tag Field Permissions with '$hidden';
+
+LET vSectionAccess_Level_SetAnalysis = '=If('&chr(39)&chr(36)&'(=Only({$*1<Permissions={"My country(s)"}>}Permissions))'&chr(39)&' = '&chr(39)&'My country(s)'&chr(39)&', '&chr(39)&'_Country_Standard_SE={1},[_BU_Standard_SE]={1},_Territory_Standard_SE={1},_FUNC_Standard_SE={1}'&chr(39)&', '&chr(39)&'1'&chr(39)&')';
+LET vSectionAccess_Level_SetAnalysis_Consents = '=If('&chr(39)&chr(36)&'(=Only({$*1<Permissions={"My country(s)"}>}Permissions))'&chr(39)&' = '&chr(39)&'My country(s)'&chr(39)&', '&chr(39)&'_Country_Standard_SE={1},_BU2_Standard_SE={1},_Territory_Standard_SE={1},_FUNC_Standard_SE={1}'&chr(39)&', '&chr(39)&'1'&chr(39)&')';
+
+///$tab SFKPI
+$(must_include=[$(vPath_Scripts)MSMART_OneOmniA_VIZ_SFKPI_Script.txt]);
+///$tab Periods
+_Periods:
+Load * Inline
+[
+_Period                     ,_PeriodSelect
+'YTD - current year'        ,'Current Year'
+'MAT - last 12 full months' ,'Last 12 Full Months'
+'L4M - last 4 full months'  ,'Last 4 Full Months'
+'L3M - last 3 full months'  ,'Last 3 Full Months'
+'LY - last year'            ,'Last Year'
+'All years'                 ,'All Years'
+'Last 12 Months'            ,'Last 12 Months'
+'Last 4 Months'             ,'Last 4 Months'
+'Last 3 Months'             ,'Last 3 Months'
+]
+where WildMatch('|'&'$(vPeriod_Values)'&'|','*|'&_Period&'|*','*|'&_PeriodSelect&'|*')>0
+;
+
+Tag field _Period with $hidden;
+Tag field _PeriodSelect with $hidden;
+
+SET vPeriod_Select = '=coalesce(only(_PeriodSelect),if(USER_ROLE = ''LOCAL MANAGER'' or USER_ROLE=''LOCAL TEAM'', ''Current Year'',''Last 12 Full Months''))';
+///$tab Manual Filters
+SET ErrorMode=0;
+	drop Table D_Calendar;
+SET ErrorMode=1;
+
+SET vTable = D_Calendar;
+SET vQVD = $(vPreLoadFolder)D_Calendar.qvd;
+SET vFieldList = %Calendar_Key
+    _Consent_Timestamp
+    Date
+    Date Num
+    Month
+    Month Year
+    Month Year Num
+    Quarter
+    Quarter Year
+    Timeframe
+    Week Year
+    Year;
+LET vPrecedingLoad = null();
+SET vWhereClause = [Year] >= (Year(Today())-2)
+        and [Date Num] <= Today();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+SET ErrorMode=0;
+	drop Table t;
+SET ErrorMode=1;
+///$tab Mappings
+CALL LoadMapping('%Country_Key'       , '$(vLoadFolder)D_Country_enriched.qvd');
+CALL LoadMapping('%Channel_Key'       , '$(vLoadFolder)D_Channel_enriched.qvd');
+CALL LoadMapping('%Territory_Key'     , '$(vLoadFolder)D_Territory_enriched.qvd');
+CALL LoadMapping('%Campaign_Key'      , '$(vLoadFolder)D_Campaign_enriched.qvd');
+
+SET vTable = T_Product_BU;
+SET vQVD = $(vPreLoadFolder)F_Consent.qvd;
+SET vFieldList =%Consent_Key
+%Account_Key;
+SET vPrecedingLoad = 'F_Consent'&'|'&%Consent_Key&'|'&%Account_Key as %Product_BU_Key;
+SET vWhereClause = exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+SET vTable = T_Product_BU;
+SET vQVD = $(vPreLoadFolder)F_MC_Email.qvd;
+SET vFieldList =%Email_Key
+%Account_Key;
+SET vPrecedingLoad = 'F_MC_Email'&'|'&%Email_Key&'|'&%Account_Key;
+SET vWhereClause = exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+SET vTable = T_Product_BU;
+SET vQVD = lib://HA_OneOmniA_CONFI/QlikMart/QM_Integration_Layer/F_RTE_Email.qvd;
+SET vFieldList =%Email_Key
+%Account_Key;
+SET vPrecedingLoad = 'F_RTE_Email'&'|'&%Email_Key&'|'&%Account_Key as %Product_BU_Key;
+SET vWhereClause = exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+CALL LoadMapping('%Product_BU_Key'            , '$(vLoadFolder)D_Business_Product_enriched.qvd',null(),null(),'exists(%Product_BU_Key)');
+Drop Table T_Product_BU;
+
+T_Target_Customer_MyTarget_Territory:
+Load
+    1 as _Target_Customer_MyTarget_Territory
+AutoGenerate(1);
+CALL LoadMapping('%Account_Key'               , '$(vPreLoadFolder)F_Universe.qvd', '_Target_Customer_MyTarget_Territory', '_Target_Customer_MyTarget_Territory','exists(_Target_Customer_MyTarget_Territory)');
+DROP Table T_Target_Customer_MyTarget_Territory;
+
+T_Target_Customer_MyTarget_Account:
+Load
+    1 as _Target_Customer_MyTarget_Account
+AutoGenerate(1);
+CALL LoadMapping('%Account_Key'               , '$(vPreLoadFolder)F_Universe.qvd', '_Target_Customer_MyTarget_Account', '_Target_Customer_MyTarget_Account','exists(_Target_Customer_MyTarget_Account)');
+DROP Table T_Target_Customer_MyTarget_Account;
+
+SET ErrorMode=0;
+	drop Table T_Country;
+SET ErrorMode=1;
+
+SET vTable = T_Country;
+SET vQVD = $(vPreLoadFolder)D_Country.qvd;
+SET vFieldList =%Country_Key
+    Country Name ISO
+    Country Detail name;
+LET vPrecedingLoad = Null();
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+Device_map:
+Mapping Load * 
+INLINE [
+  Device Type, Mapped Type
+  Samsung Galaxy, Mobile
+  iPhone, Mobile
+  Desire, Mobile
+  iPad, Tablet
+  PC, Desktop
+  Macintosh, Desktop
+];
+MAP [Device Type] using 'Device_map';
+
+mConsentSource:
+Mapping Load * 
+INLINE [
+    Source, Map
+    CRM, CRM
+    Paper form, Paper form
+    Website, Website
+    CSO, CSO
+    IQVIA, IQVIA
+    External Application, External Application
+    Remote Detailing, Remote call
+    Marketing Cloud - Unsubscribe all, M3 Suite
+    Approved Email, RTE
+    Marketing Cloud - Preference Center, M3 Suite
+    Call Center, Call Center
+    Marketing Cloud, M3 Suite
+];
+
+Country_Mapping:    
+Mapping
+LOAD
+	[Country Detail name] as [Country],
+	%Country_Key
+resident [T_Country]
+where not isnull([Country Detail name]);
+    
+Country_Mapping_ISO:    
+Mapping
+LOAD
+	[Country Name ISO] as [Country],
+	%Country_Key
+resident [T_Country]
+Where not isnull([Country Name ISO]);
+
+CALL LoadMapping('%Account_Key'               , '$(vPreLoadFolder)/F_Universe.qvd', '%Segmentation_HCP_Flat_Key', 'SegmentationFlatMapping');
+
+SET ErrorMode=0;
+	drop Table T_Country;
+SET ErrorMode=1;
+///$tab Facts
+SET vTable = Facts_t;
+SET vQVD = $(vPreLoadFolder)F_Consent.qvd;
+SET vFieldList =%Calendar_Key
+    %Account_Key
+    %Channel_Key
+    %Consent_Key
+    %Product_Key
+    %Territory_Key
+    Account_Cnt
+    _ActiveOptIn
+    _CurrentConsent
+    _DataSource_F_Consent
+    _Fact_Actual
+    _TestAccount
+    Fact_Function
+    _IndividualCustomer
+    ;
+LET vPrecedingLoad = Null();
+SET vWhereClause = Exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+concatenate(Facts_t)
+load
+    null() as [%Calendar_Key]
+    ,null() as [%Account_Key]
+    ,null() as [%Channel_Key]
+    ,null() as [%Consent_Key]
+    ,null() as [%Product_Key]
+    ,null() as [%Territory_Key]
+    ,null() as [Account_Cnt]
+    ,null() as [_ActiveOptIn]
+    ,null() as [_CurrentConsent]
+    ,null() as [_DataSource_F_Consent]
+    ,null() as [_Fact_Actual]
+    ,null() as [_TestAccount]
+    ,null() as [Fact_Function]
+    ,null() as [_IndividualCustomer]
+AutoGenerate(0);
+
+Inner join (Facts_t)
+load 1 as _IndividualCustomer
+autogenerate(1);
+
+Facts:
+Load *
+    ,ApplyMap('mProduct_BU_Key', 'F_Consent'&'|'&%Consent_Key&'|'&%Account_Key, '#NA')     as [%Product_BU_Key_OmniA]
+    ,ApplyMap('mTerritory_Key', %Territory_Key, ApplyMap('mTerritory_Key', '#NA'&'|'&'Mix'))     as [%Territory_Key_OmniA]
+    ,applymap('m_Target_Customer_MyTarget_Account', %Account_Key,0) as [_Target_Customer_MyTarget_Account]
+    ,applymap('m_Target_Customer_MyTarget_Territory', %Account_Key,0) as [_Target_Customer_MyTarget_Territory]
+    ,'Mix' as [%Function_Key]
+Resident Facts_t;
+
+Drop Table Facts_t;
+
+SET vTable = Facts_t;
+SET vQVD = lib://HA_OneOmniA_CONFI/QlikMart/QM_Integration_Layer/F_MC_Email.qvd;
+SET vFieldList =%Calendar_Key
+	%Account_Key
+	%Campaign_Key
+	%Channel_Key
+	%Function_Key
+	%Product_Key
+	%Email_Key
+	Account_Cnt
+	Email_Opened_Cnt
+	_DataSource_F_MC_Email
+	_EmailDelivered
+	_Fact_Actual
+	_TestAccount
+    Fact_Function
+    _IndividualCustomer;
+LET vPrecedingLoad = Null();
+SET vWhereClause = Exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+concatenate(Facts_t)
+load
+	 null() as [%Calendar_Key]
+	,null() as [%Account_Key]
+	,null() as [%Campaign_Key]
+	,null() as [%Channel_Key]
+	,null() as [%Function_Key]
+	,null() as [%Product_Key]
+	,null() as [%Segment_Key]
+	,null() as [%Email_Key]
+	,null() as [Account_Cnt]
+	,null() as [Email_Opened_Cnt]
+	,null() as [_DataSource_F_MC_Email]
+	,null() as [_EmailDelivered]
+	,null() as [_Fact_Actual]
+	,null() as [_TestAccount]
+    ,null() as [Fact_Function]
+    ,null() as [_IndividualCustomer]
+AutoGenerate(0);
+
+Inner join (Facts_t)
+load distinct [%Account_Key]
+Resident Facts;
+
+Concatenate(Facts)
+Load *
+    ,ApplyMap('mProduct_BU_Key', 'F_MC_Email'&'|'&%Email_Key&'|'&%Account_Key, '#NA')     as [%Product_BU_Key_OmniA]
+    ,ApplyMap('mTerritory_Key', '#NA'&'|'&%Function_Key)     as [%Territory_Key_OmniA]
+    ,applymap('m_Target_Customer_MyTarget_Account', %Account_Key,0) as [_Target_Customer_MyTarget_Account]
+    ,applymap('m_Target_Customer_MyTarget_Territory', %Account_Key,0) as [_Target_Customer_MyTarget_Territory]
+Resident Facts_t;
+
+Drop Table Facts_t;
+
+SET vTable = Facts_t;
+SET vQVD = $(vPreLoadFolderHA)F_RTE_Email.qvd;
+SET vFieldList =%Calendar_Key
+	%Account_Key
+	%Campaign_Key
+	%Channel_Key
+	%Function_Key
+	%Product_Key
+	%Territory_Key
+    %Email_Key
+	Account_Cnt
+	Email_Opened_Cnt
+	_DataSource_F_RTE_Email
+	_EmailDelivered
+	_Fact_Actual
+	_TestAccount
+	TMP_User_GlobalBU
+    Fact_Function
+    _Target_Customer_MyTarget_Account
+    _Target_Customer_MyTarget_Territory
+    _IndividualCustomer;
+//    %Segment_Key
+LET vPrecedingLoad = Null();
+SET vWhereClause = Exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+concatenate(Facts_t)
+load
+	null() as [%Calendar_Key]
+	,null() as [%Account_Key]
+	,null() as [%Campaign_Key]
+	,null() as [%Channel_Key]
+	,null() as [%Function_Key]
+	,null() as [%Product_Key]
+	,null() as [%Segment_Key]
+	,null() as [%Territory_Key]
+	,null() as [%Email_Key]
+	,null() as [Account_Cnt]
+	,null() as [Email_Opened_Cnt]
+	,null() as [_DataSource_F_RTE_Email]
+	,null() as [_EmailDelivered]
+	,null() as [_Fact_Actual]
+	,null() as [_TestAccount]
+	,null() as [TMP_User_GlobalBU]
+    ,null() as [Fact_Function]
+    ,null() as [_Target_Customer_MyTarget_Account]
+    ,null() as [_Target_Customer_MyTarget_Territory]
+    ,null() as [_IndividualCustomer]
+AutoGenerate(0);
+
+Inner join (Facts_t)
+load distinct [%Account_Key]
+Resident Facts;
+
+Concatenate(Facts)
+Load *
+    ,ApplyMap('mProduct_BU_Key', 'F_RTE_Email'&'|'&%Email_Key&'|'&%Account_Key, '#NA')     as [%Product_BU_Key_OmniA]
+    ,ApplyMap('mTerritory_Key', Coalesce(%Territory_Key, '#NA'&'|'&%Function_Key), ApplyMap('mTerritory_Key', '#NA'&'|'&%Function_Key))     as [%Territory_Key_OmniA]
+Resident Facts_t;
+
+Drop Table Facts_t;
+///$tab Addons to Facts
+Rename Table Facts to Facts_old;
+
+Facts:
+NoConcatenate LOAD
+     [%Calendar_Key]
+    ,[%Account_Key]
+    ,ApplyMap('mCampaign_Key', %Campaign_Key,null())   as %Campaign_Key_OmniA
+    ,ApplyMap('mChannel_Key', %Channel_Key,null())   as %Channel_Key_OmniA
+    ,[%Consent_Key]
+    ,[%Function_Key]
+    ,[%Product_Key]
+    ,%Territory_Key_OmniA
+    ,[%Product_BU_Key_OmniA]
+    ,[Account_Cnt]
+    ,[_ActiveOptIn]
+    ,[_CurrentConsent]
+    ,[_DataSource_F_Consent]
+    ,[_DataSource_F_MC_Email]
+    ,[_DataSource_F_RTE_Email]
+    ,[_EmailDelivered]
+    ,[_Fact_Actual]
+    ,[_TestAccount]
+    ,[Email_Opened_Cnt]
+    ,[TMP_User_GlobalBU]
+    ,[Fact_Function]
+    ,alt([_Target_Customer_MyTarget_Account],0) as [_Target_Customer_MyTarget_Account]
+    ,alt([_Target_Customer_MyTarget_Territory],0) as [_Target_Customer_MyTarget_Territory]
+resident Facts_old;
+
+Drop Table Facts_old;
+
+inner join (Facts)
+load Distinct
+	[%Account_Key]
+from '$(vPreLoadFolder)F_Universe.qvd' (qvd)
+where _IndividualCustomer=1;
+
+
+///$tab D_Calendar
+SET ErrorMode=0;
+	drop Table D_Calendar;
+SET ErrorMode=1;
+
+SET vTable = D_Calendar;
+SET vQVD = $(vPreLoadFolder)D_Calendar.qvd;
+SET vFieldList = %Calendar_Key
+    _Consent_Timestamp
+    Date
+    Date Num
+    Month
+    Month Year
+    Month Year Num
+    Quarter
+    Quarter Year
+    Timeframe
+    Week Year
+    Year;
+LET vPrecedingLoad = null();
+SET vWhereClause = exists(%Calendar_Key)
+    and [Year] >= (Year(Today())-2)
+        and [Date Num] <= Today();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+///$tab D_Consent
+[D_Consent]:
+LOAD 
+	 *
+	,pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@') as [Consent Email Channel]
+	,pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails')+1,'Other','RTE','Corp@') as [Consent Channel Group]
+    ,applymap('mConsentSource',[Consent Source],'Other') as [Consent Source2]
+FROM [$(vPreLoadFolder)D_Consent.qvd] (qvd);
+
+drop field [Consent Source];
+Rename field [Consent Source2] to [Consent Source];
+
+tConsentEmails:
+NoConcatenate
+load Distinct
+	%Consent_Key
+    ,1 as tConsentEmail
+Resident D_Consent
+where [Consent Channel Value] like '*@*';
+
+left join (tConsentEmails)
+Load Distinct
+	 [%Consent_Key]
+    ,[%Account_Key]
+Resident Facts;
+
+mConsentEmails:
+Mapping
+Load Distinct
+	[%Account_Key]
+    ,tConsentEmail
+Resident tConsentEmails;
+
+drop Table tConsentEmails;
+
+[Consent Email Channel]:
+Load Distinct
+	[Consent Email Channel]
+Resident [D_Consent];
+
+drop field [Consent Email Channel] From [D_Consent];
+
+///$tab D_KTL
+SET ErrorMode=0;
+	drop Table D_KTL;
+SET ErrorMode=1;
+
+SET vTable = D_KTL;
+SET vQVD = $(vPreLoadFolder)D_KTL.qvd;
+SET vFieldList =%Account_Key
+    HCP Tier
+    HCP Tier (Commercial)
+    HCP Tier (Medical)
+    KTL Type
+    KTL Type (Commercial)
+    KTL Type (Medical)
+    ;
+SET vPrecedingLoad = [%Account_Key]
+    ,coalesce([HCP Tier],'None') as [Medical Tier]
+    ,coalesce([HCP Tier (Commercial)],'None') as [Medical Tier (Commercial)]
+    ,coalesce([HCP Tier (Medical)],'None') as [Medical Tier (Medical)]
+    ,[KTL Type]
+    ,[KTL Type (Commercial)]
+    ,[KTL Type (Medical)]
+    ;
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+Map_Medical_Tier:
+Mapping Load Distinct
+%Account_Key,
+1
+Resident D_KTL
+Where not [Medical Tier]='None';
+
+///$tab D_Account
+SET ErrorMode=0;
+	drop Table D_Account;
+SET ErrorMode=1;
+
+SET vTable = D_Behavioral_Segmentation;
+SET vQVD = $(vPreLoadFolder)D_Account_Segmentation.qvd;
+SET vFieldList =%Account_Key
+    Behavioral Segmentation;
+LET vPrecedingLoad = null();
+SET vWhereClause = NOT ISNULL("Behavioral Segmentation");
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+SET ErrorMode=0;
+	drop Table D_Account_Segmentation;
+SET ErrorMode=1;
+
+SET vTable = D_Account_Segmentation;
+SET vQVD = $(vPreLoadFolder)D_Account_Segmentation.qvd;
+SET vFieldList =%Account_Key
+    HCP Segmentation
+    HCP Segmentation (Commercial)
+    HCP Segmentation (Medical);
+SET vPrecedingLoad = distinct [%Account_Key]
+    ,coalesce([HCP Segmentation],'None') as [HCP Segmentation]
+    ,coalesce([HCP Segmentation],'None') as [Commercial Segmentation]
+    ,coalesce([HCP Segmentation (Commercial)],'None') as [HCP Segmentation (Commercial)]
+    ,coalesce([HCP Segmentation (Medical)],'None') as [HCP Segmentation (Medical)]
+    ;
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+NoConcatenate
+Segmented_tmp:
+Load [%Account_Key]
+    ,[HCP Segmentation]
+    ,[Commercial Segmentation]
+    ,[HCP Segmentation (Commercial)]
+    ,[HCP Segmentation (Medical)]
+Resident D_Account_Segmentation;
+
+Left join (Segmented_tmp)
+Load
+	%Account_Key
+	,[Behavioral Segmentation]
+Resident D_Behavioral_Segmentation;
+
+Map_Pre_Segmentation:
+Mapping Load Distinct
+%Account_Key,
+1
+Resident Segmented_tmp
+Where not (Coalesce([HCP Segmentation], 'None')='None'
+	AND Coalesce([Commercial Segmentation], 'None')='None'
+    AND Coalesce([Behavioral Segmentation], 'None')='None');
+Drop table Segmented_tmp;
+
+SET vTable = D_KTL;
+SET vQVD = $(vPreLoadFolder)D_KTL.qvd;
+SET vFieldList =%Account_Key
+    HCP Tier
+    HCP Tier (Commercial)
+    HCP Tier (Medical)
+    KTL Type
+    KTL Type (Commercial)
+    KTL Type (Medical)
+    ;
+SET vPrecedingLoad = [%Account_Key]
+    ,coalesce([HCP Tier],'None') as [Medical Tier]
+    ,coalesce([HCP Tier (Commercial)],'None') as [Medical Tier (Commercial)]
+    ,coalesce([HCP Tier (Medical)],'None') as [Medical Tier (Medical)]
+    ,[KTL Type]
+    ,[KTL Type (Commercial)]
+    ,[KTL Type (Medical)]
+    ;
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+Map_Medical_Tier:
+Mapping Load Distinct
+%Account_Key,
+1
+Resident D_KTL
+Where not [Medical Tier]='None';
+
+D_Account_Filter:
+NoConcatenate
+load
+    0 as [Account Test User]
+autogenerate(1);
+
+SET vTable = D_Account;
+SET vQVD = $(vPreLoadFolder)D_Account.qvd;
+SET vFieldList =%Account_Key
+    _HCP Validated
+    Account Test User
+    Account Country
+    Digital Segmentation
+    Specialty Merck
+    HIPE ID
+    HCP Therapeutic Area
+    ;
+SET vPrecedingLoad =[%Account_Key],
+    [_HCP Validated],
+    [Account Test User],
+    [Account Country] as [Country],
+    coalesce([Digital Segmentation],'Not Segmented') as [Digital Segmentation],
+    IF(alt(Applymap('Map_Pre_Segmentation', [%Account_Key]),0)=1 
+        OR alt(Applymap('Map_Medical_Tier', [%Account_Key]),0)=1
+        OR NOT coalesce([Digital Segmentation],'Not Segmented')='Not Segmented'
+        ,'Segmented', 'Non Segmented') AS Segmented,
+    [Specialty Merck],
+    IF(NOT ISNULL([HIPE ID]),'Yes','No') AS [HIPE Verified],
+    [HCP Therapeutic Area];
+SET vWhereClause = Exists([Account Test User]);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+drop table D_Account_Filter;
+
+Outer Join(D_Account_Segmentation)
+Load Distinct
+    [%Account_Key],
+    [Digital Segmentation]
+Resident D_Account;
+
+Drop field [Digital Segmentation] from D_Account;
+
+T_Accounts:
+NoConcatenate Load Distinct
+	%Account_Key
+Resident Facts;
+
+Outer Join (T_Accounts)
+	Load Distinct
+    	%Account_Key
+        ,1 as [D_Account]
+    Resident D_Account;
+
+Outer Join (T_Accounts)
+	Load Distinct
+    	%Account_Key
+        ,1 as [D_Account_Segmentation]
+    Resident D_Account_Segmentation;
+
+Outer Join (D_Account_Segmentation)
+Load  distinct
+	%Account_Key
+Resident T_Accounts;
+
+Left Join (T_Accounts)
+	Load Distinct
+    	%Account_Key
+        ,1 as [D_KTL]
+    Resident D_KTL;
+
+Concatenate (D_KTL)
+Load
+	%Account_Key
+    ,'None' as [Medical Tier]
+Resident T_Accounts
+where isnull(D_KTL);
+
+drop Table T_Accounts;
+
+Left join (D_Account)
+Load distinct
+    %Account_Key
+    ,[Medical Tier]
+    ,[KTL Type]
+    ,[Medical Tier (Commercial)]
+    ,[Medical Tier (Medical)]
+    ,[KTL Type (Commercial)]
+    ,[KTL Type (Medical)]
+resident D_KTL;
+
+Drop Table D_KTL;
+
+Left join (D_Account)
+Load distinct
+    %Account_Key
+    ,coalesce([HCP Segmentation],'None') as [HCP Segmentation]
+    ,coalesce([Commercial Segmentation],'None') as [Commercial Segmentation]
+    ,coalesce([Digital Segmentation],'None') as [Digital Segmentation]
+    ,[HCP Segmentation (Commercial)]
+    ,[HCP Segmentation (Medical)]
+resident D_Account_Segmentation;
+
+Drop Table D_Account_Segmentation;
+
+SET vTable = t;
+SET vQVD = $(vPreLoadFolder)F_Consent.qvd;
+SET vFieldList =%Consent_Key
+    %Account_Key
+    %Calendar_Key
+    Source System;
+SET vPrecedingLoad = Distinct
+     %Consent_Key
+    ,%Account_Key
+    ,%Calendar_Key
+    ,[Source System];
+SET vWhereClause = Exists(%Calendar_Key);
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+SET vTable = t0;
+SET vQVD = $(vPreLoadFolder)D_Calendar.qvd;
+SET vFieldList =%Calendar_Key
+    Date Num;
+SET vPrecedingLoad = 
+    [%Calendar_Key]
+    ,max([Date Num]) as MDN
+    Group by %Calendar_Key;
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+inner join (t)
+Load
+	[%Calendar_Key]
+    ,MDN
+Resident t0;
+
+Drop Table t0;
+
+inner join (t)
+Load
+	[Source System]
+    ,max(MDN) as MDN
+Resident t
+group by [Source System];
+
+left join (t)
+load Distinct
+	[%Consent_Key]
+    ,[Consent Channel Type]
+    ,[Consent Type]
+Resident D_Consent;
+
+outer join (t)
+Load Distinct
+	[%Account_Key]
+Resident D_Account;
+
+outer join (D_Account)
+Load
+	[%Account_Key]
+    ,if(Coalesce(Types,'') like '',if(Coalesce(OptOut,'') like '','None',OptOut),Types) as [Email Consent]
+;
+Load
+	[%Account_Key]
+    ,concat(DISTINCT if([Consent Type] like 'Opt-In'
+    	,pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@')
+        ,null()
+        ),' & ') as Types
+    ,concat(DISTINCT if([Consent Type] like 'Opt-Out'
+    	,[Consent Type]
+        ,null()
+        ),' & ') as OptOut
+Resident t
+group by [%Account_Key];
+
+drop Table t;
+
+RENAME TABLE D_Account to D_Account_old;
+
+//FIXME: Change here if you want to switch from Territory-driven to Account-driven targeting
+//_Target_Customer_MyTarget_Territory - Territory-driven
+//_Target_Customer_MyTarget_Account - Account-driven
+my_target:
+NoConcatenate load
+    0 as [_Target_Customer_MyTarget_Account]
+    ,0 as [my_target]
+    ,0 as [my_target_flg]
+    ,'Non-Targeted' AS [Targeted]
+autogenerate(1);
+concatenate(my_target)
+load
+    1 as [_Target_Customer_MyTarget_Account]
+    ,1 as [my_target]
+    ,1 as [my_target_flg]
+    ,'Targeted' AS [Targeted]
+autogenerate(1);
+
+NoConcatenate
+D_Account:
+Load
+	*,
+    ApplyMap('Country_Mapping',"Account Country",ApplyMap('Country_Mapping_ISO',"Account Country",''))					as %Country_Key
+    ;
+LOAD
+   "Account Country",
+   %Account_Key,
+   "HCP First Name",
+   "HCP Last Name",
+   "_HCP Validated",
+	Account,
+    "Account External Id",
+	"OneKey Id",
+	"Account City",
+    if(len([Account Email])>0,left(subfield([Account Email],'@',1),3)&'***@'&left(subfield([Account Email],'@',2),2)&'***'&right(subfield([Account Email],'@',2),3)) as "Account Email",
+    //"Account Email",
+    "Main Customer Account",
+	"Account Address Line 1",
+    "Account Primary State"	as [HCP State/province],
+    "Primary Top Level Account" 	as [HCP Place of work (HCO)],
+	"Specialty 1",
+	"HCP Therapeutic Area",
+	"Opt-In Corporate Emails",
+	"Opt-In RTE",
+    "Account Test User",
+    Account_Id,
+    "Digital Affinity",
+    "HCP Franchise",
+    "Specialty Merck",
+    "HIPE ID",
+    "Specialty 2",
+    ApplyMap('mSegmentationFlatMapping', %Account_Key, 'n/a') as %Segmentation_HCP_Key
+    //_IndividualCustomer
+from [$(vPreLoadFolder)D_Account.qvd] (qvd)
+  Where
+ 	Exists(%Account_Key);
+
+//Inner join (D_Account)
+//Load 
+//    1 as _IndividualCustomer
+//autogenerate(1);
+
+$(must_include=[$(vPath_Scripts)Viz_OneOMnia_Region_Split.qvs]);
+Inner join (D_Account)
+Load distinct
+    %Account_Key
+Resident D_Account Where $(vAccountFilter);
+
+Inner Join (D_Behavioral_Segmentation)
+Load  distinct
+	%Account_Key
+Resident D_Account;
+
+Inner Join (Facts)
+Load  distinct
+	%Account_Key
+Resident D_Account;
+
+Drop Table D_Country_Tmp;
+
+left join (D_Account)
+LOAD 
+     [%Account_Key]
+    ,[Digital Segmentation]
+    ,[HCP Segmentation]
+    ,[HCP Segmentation (Commercial)]
+    ,[HCP Segmentation (Medical)]
+    ,[Segmented]
+    ,[Commercial Segmentation]
+    ,[Medical Tier]
+    ,[Medical Tier (Commercial)]
+    ,[Medical Tier (Medical)]
+    ,[KTL Type]
+    ,[KTL Type (Commercial)]
+    ,[KTL Type (Medical)]
+    ,[HIPE Verified]
+    ,[Email Consent]
+RESIDENT D_Account_old;
+DROP TABLE D_Account_old;
+
+mAccountEmails:
+Mapping Load
+	[%Account_Key]
+    ,[Account Email]
+Resident D_Account
+where coalesce("Account Email",'') like '*@*';
+
+Rename table D_Account to D_Account_old;
+
+D_Account:
+NoConcatenate Load
+	 *
+    ,if(alt(ApplyMap('mConsentEmails',[%Account_Key],0),0)=1 or coalesce(ApplyMap('mAccountEmails',[%Account_Key],null()),'') like '*@*',1,0)								as Acount_Email_Valid
+RESIDENT D_Account_old;
+DROP TABLE D_Account_old;
+
+D_HCP_Franchise:
+NoConcatenate LOAD Distinct
+    [HCP Franchise]
+    ,'1|'&Upper([HCP Franchise]) as SECTION_ACCESS_BU
+    ,1 as _BU_Standard_SE
+resident D_Account;
+
+Concatenate(D_HCP_Franchise)
+load
+    [HCP Franchise]
+    ,'2|'&Upper([HCP Franchise]) as SECTION_ACCESS_BU
+    ,null() as _BU_Standard_SE
+resident D_Account;
+
+
+Rename Field %Segmentation_HCP_Key to %Segmentation_HCP_Flat_Key;
+
+mHCPSegmentation:
+Mapping
+Load * Inline [
+    OldValue, NewValue
+    n/a, None
+]
+;
+
+SET vTable = D_Segmentation_HCP_Flat;
+SET vQVD = '$(vPath_QlikMart_Integration)D_Segmentation_HCP_Flat.qvd';
+SET vFieldList =%Segmentation_HCP_Flat_Key
+    Segmentation HCP Account Region
+    Segmentation HCP Fertility Region
+    Segmentation HCP Cardio Metabolic & Endocrinology Region
+    Segmentation HCP Neurology & Immunology Region
+    Segmentation HCP Oncology Region
+    Segmentation HCP Bavencio MCC Region
+    Segmentation HCP Endocrinology Region
+    Segmentation HCP Neurology Region
+    Segmentation HCP Thyroid Region
+    Segmentation HCP General Medicine Region
+    Segmentation HCP Diabetes Region
+    Segmentation HCP Cardiology Region
+    Segmentation HCP Gonal_F Region
+    Segmentation HCP Tepmetko Region
+    Segmentation HCP Glucophage Region
+    Segmentation HCP Concor AM Region
+    Segmentation HCP Ovidrel Region
+    Segmentation HCP Concor Region
+    Segmentation HCP Rebif Region
+    Segmentation HCP Mavenclad Region
+    Segmentation HCP Erbitux Region
+    Segmentation HCP Euthyrox Region
+    Segmentation HCP Saizen Region
+    Segmentation HCP Bavencio Region
+    Segmentation HCP Cetrotide Region
+    Segmentation HCP Glucovance Region
+    Segmentation HCP Pergoveris Region
+    Segmentation HCP Erbitux mCRC Region
+    Segmentation HCP Bavencio RCC Region
+    Segmentation HCP Erbitux SCCHN Region
+    Segmentation HCP Bavencio UC Region;
+SET vPrecedingLoad = 
+     %Segmentation_HCP_Flat_Key
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Account Region],'n/a')) as [Segmentation HCP Account Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Fertility Region],'n/a')) as [Segmentation HCP Fertility Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Cardio Metabolic & Endocrinology Region],'n/a')) as [Segmentation HCP Cardio Metabolic & ,Endocrinology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Neurology & Immunology Region],'n/a')) as [Segmentation HCP Neurology & Immunology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Oncology Region],'n/a')) as [Segmentation HCP Oncology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Bavencio MCC Region],'n/a')) as [Segmentation HCP Bavencio MCC Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Endocrinology Region],'n/a')) as [Segmentation HCP Endocrinology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Neurology Region],'n/a')) as [Segmentation HCP Neurology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Thyroid Region],'n/a')) as [Segmentation HCP Thyroid Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP General Medicine Region],'n/a')) as [Segmentation HCP General Medicine Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Diabetes Region],'n/a')) as [Segmentation HCP Diabetes Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Cardiology Region],'n/a')) as [Segmentation HCP Cardiology Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Gonal_F Region],'n/a')) as [Segmentation HCP Gonal_F Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Tepmetko Region],'n/a')) as [Segmentation HCP Tepmetko Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Glucophage Region],'n/a')) as [Segmentation HCP Glucophage Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Concor AM Region],'n/a')) as [Segmentation HCP Concor AM Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Ovidrel Region],'n/a')) as [Segmentation HCP Ovidrel Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Concor Region],'n/a')) as [Segmentation HCP Concor Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Rebif Region],'n/a')) as [Segmentation HCP Rebif Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Mavenclad Region],'n/a')) as [Segmentation HCP Mavenclad Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Erbitux Region],'n/a')) as [Segmentation HCP Erbitux Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Euthyrox Region],'n/a')) as [Segmentation HCP Euthyrox Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Saizen Region],'n/a')) as [Segmentation HCP Saizen Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Bavencio Region],'n/a')) as [Segmentation HCP Bavencio Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Cetrotide Region],'n/a')) as [Segmentation HCP Cetrotide Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Glucovance Region],'n/a')) as [Segmentation HCP Glucovance Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Pergoveris Region],'n/a')) as [Segmentation HCP Pergoveris Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Erbitux mCRC Region],'n/a')) as [Segmentation HCP Erbitux mCRC Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Bavencio RCC Region],'n/a')) as [Segmentation HCP Bavencio RCC Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Erbitux SCCHN Region],'n/a')) as [Segmentation HCP Erbitux SCCHN Region]
+    ,applymap('mHCPSegmentation',coalesce([Segmentation HCP Bavencio UC Region],'n/a')) as [Segmentation HCP Bavencio UC Region]
+    ;
+LET vWhereClause = 'Exists(%Segmentation_HCP_Flat_Key)';
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+
+Concatenate(D_Segmentation_HCP_Flat)
+LOAD
+    -1 AS     [%Segmentation_HCP_Flat_Key],
+    'None' AS [Segmentation HCP Account Region],
+    'None' AS [Segmentation HCP Fertility Region],
+    'None' AS [Segmentation HCP Cardio Metabolic & Endocrinology Region],
+    'None' AS [Segmentation HCP Neurology & Immunology Region],
+    'None' AS [Segmentation HCP Oncology Region],
+    'None' AS [Segmentation HCP Bavencio MCC Region],
+    'None' AS [Segmentation HCP Endocrinology Region],
+    'None' AS [Segmentation HCP Neurology Region],
+    'None' AS [Segmentation HCP Thyroid Region],
+    'None' AS [Segmentation HCP General Medicine Region],
+    'None' AS [Segmentation HCP Diabetes Region],
+    'None' AS [Segmentation HCP Cardiology Region],
+    'None' AS [Segmentation HCP Gonal_F Region],
+    'None' AS [Segmentation HCP Tepmetko Region],
+    'None' AS [Segmentation HCP Glucophage Region],
+    'None' AS [Segmentation HCP Concor AM Region],
+    'None' AS [Segmentation HCP Ovidrel Region],
+    'None' AS [Segmentation HCP Concor Region],
+    'None' AS [Segmentation HCP Rebif Region],
+    'None' AS [Segmentation HCP Mavenclad Region],
+    'None' AS [Segmentation HCP Erbitux Region],
+    'None' AS [Segmentation HCP Euthyrox Region],
+    'None' AS [Segmentation HCP Saizen Region],
+    'None' AS [Segmentation HCP Bavencio Region],
+    'None' AS [Segmentation HCP Cetrotide Region],
+    'None' AS [Segmentation HCP Glucovance Region],
+    'None' AS [Segmentation HCP Pergoveris Region],
+    'None' AS [Segmentation HCP Erbitux mCRC Region],
+    'None' AS [Segmentation HCP Bavencio RCC Region],
+    'None' AS [Segmentation HCP Erbitux SCCHN Region],
+    'None' AS [Segmentation HCP Bavencio UC Region]
+Autogenerate(1);
+
+Rename Field %Segmentation_HCP_Flat_Key to %Segmentation_HCP_Key;
+
+SET vTable = T_Calendar;
+SET vQVD = $(vPreLoadFolder)D_Calendar.qvd;
+SET vFieldList = %Calendar_Key;
+LET vPrecedingLoad = null();
+SET vWhereClause = 
+        [Year] >= (Year(Today())-5)
+    and [Date Num] <= Today();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+LET vTable=null();LET vQVD=null();LET vFieldList=null();LET vPrecedingLoad=null();LET vWhereClause=null();
+
+[T_Accounts]:
+NoConcatenate load 
+    null() as [%Account_Key]
+AutoGenerate(0);
+
+[T_Accounts_Interacted]:
+NoConcatenate load 
+    null() as [%Account_Key]
+AutoGenerate(0);
+
+SET vFieldList = %Account_Key;
+SET vWhereClause = Exists(%Calendar_Key);
+LET vPrecedingLoad = null();
+
+for each vFile in 'F_Webinars','F_Consent','F_MC_Email'
+    SET vTable = T_Accounts_$(vFile);
+    SET vQVD = $(vPreLoadFolder)$(vFile).qvd;
+    call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,1);
+
+    outer join([T_Accounts])
+    load [%Account_Key] resident [T_Accounts_$(vFile)];
+
+    if alt(match(vFile,'F_MC_Email','F_RTE_Email'),0)>0 then
+        outer join([T_Accounts_Interacted])
+        load [%Account_Key], 1 as _Interacted resident [T_Accounts_$(vFile)];
+    endif;
+
+    Drop Table [T_Accounts_$(vFile)];
+next vFile;
+for each vFile in 'F_Call','F_RTE_Email'
+    SET vTable = T_Accounts_$(vFile);
+    SET vQVD = $(vPreLoadFolderHA)$(vFile).qvd;
+    call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,1);
+
+    outer join([T_Accounts])
+    load [%Account_Key] resident [T_Accounts_$(vFile)];
+
+    if alt(match(vFile,'F_MC_Email','F_RTE_Email'),0)>0 then
+        outer join([T_Accounts_Interacted])
+        load [%Account_Key], 1 as _Interacted resident [T_Accounts_$(vFile)];
+    endif;
+
+    Drop Table [T_Accounts_$(vFile)];
+next vFile;
+LET vTable=null();LET vQVD=null();LET vFieldList=null();LET vPrecedingLoad=null();LET vWhereClause=null();LET vFile = null();
+
+outer join([T_Accounts_Interacted])
+load [%Account_Key] resident [D_Account];
+
+outer join([T_Accounts_Interacted])
+load [%Account_Key] resident [T_Accounts];
+
+left join ([D_Account])
+Load Distinct
+	[%Account_Key]
+    ,alt(_Interacted,0) as _Interacted
+Resident T_Accounts_Interacted;
+
+inner join ([D_Account])
+Load Distinct
+	[%Account_Key]
+Resident T_Accounts;
+
+Drop Table [T_Calendar];
+Drop Table [T_Accounts];
+Drop Table [T_Accounts_Interacted];
+
+left join(D_Account)
+	Load Distinct
+    	Account_Id
+		,if(alt(WildMatch(Account_Id,'LATAM_iConnect|*','EMEA_Veeva|*','APAC_iConnect|*','APAC_Veeva|*'),0)>0,1,0) as _AccountCRMFlag
+    Resident D_Account;
+
+Concatenate(D_Account)
+Load Distinct
+    %Account_Key
+    ,Acount_Email_Valid
+    ,_AccountCRMFlag
+    ,[HCP Franchise]
+    ,[Commercial Segmentation]
+    ,[Digital Segmentation]
+    ,'No detailed access to selected country' as Account
+    ,'SA|' & %Country_Key as %Country_Key
+    ,_Interacted
+Resident D_Account; 
+///$tab D_Campaign
+SET ErrorMode=0;
+	drop Table [D_Campaign];
+SET ErrorMode=1;
+
+///$tab D_Country
+SET ErrorMode=0;
+	drop Table [D_Country];
+SET ErrorMode=1;
+
+mConsentsRTE:
+mapping
+LOAD
+    ApplyMap('Country_Mapping',"country name",ApplyMap('Country_Mapping_ISO',"country name",'')) as Country
+    ,"RTE requered"
+FROM [$(vBaseConnection)04_TMP/consents_RTE.xlsx]
+(ooxml, embedded labels, table is Sheet1);
+
+mConsentsCorp:
+mapping
+LOAD
+    ApplyMap('Country_Mapping',"country name",ApplyMap('Country_Mapping_ISO',"country name",'')) as Country
+    ,"Informational Emails"
+FROM [$(vBaseConnection)04_TMP/consents_RTE.xlsx]
+(ooxml, embedded labels, table is Sheet1);
+
+SET vTable = D_Country;
+SET vQVD = $(vLoadFolder)D_Country_enriched.qvd;
+SET vFieldList =%Country_Key
+    Country
+    Region
+    Subregion 1
+    Subregion 2
+    Subregion 3
+    Subregion 4
+    SECTION_ACCESS_COUNTRY
+    Country & Region
+    _Country_Standard_SE;
+SET vPrecedingLoad = if(subfield(SECTION_ACCESS_COUNTRY,'|',1)=1,%Country_Key,'SA|'&%Country_Key) as %Country_Key
+    ,[Country]
+    ,[Region]
+    ,[Subregion 1]
+    ,[Subregion 2]
+    ,[Subregion 3]
+    ,[Subregion 4]
+    ,SECTION_ACCESS_COUNTRY
+    ,ApplyMap('mConsentsRTE',%Country_Key,1) as CRTERequired
+    ,ApplyMap('mConsentsCorp',%Country_Key,1) as CCorpRequired
+    ,[Country & Region]
+    ,_Country_Standard_SE
+    ;
+LET vWhereClause = Null();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+///$tab D_Channel
+SET ErrorMode=0;
+	drop Table [D_Channel];
+SET ErrorMode=1;
+
+SET vTable = D_Channel;
+SET vQVD = '$(vLoadFolder)D_Channel_enriched.qvd';
+SET vFieldList = $%Channel_Key_OmniA;
+LET vPrecedingLoad = Null();
+LET vWhereClause = 'Exists(%Channel_Key_OmniA)';
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+///$tab D_Function
+SET ErrorMode=0;
+	drop Table [D_Function];
+SET ErrorMode=1;
+
+SET vTable = D_Function;
+SET vQVD = '$(vLoadFolder)D_Function.qvd';
+SET vFieldList = %Function_Key
+    Function;
+LET vPrecedingLoad = Null();
+LET vWhereClause = 'Exists(%Function_Key)';
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+FunctionSelector:
+Load * Inline [
+	FunctionSelector
+    Commercial
+    Medical
+];
+///$tab D_Territory
+SET ErrorMode=0;
+	drop Table [D_Territory];
+SET ErrorMode=1;
+
+SET vTable = D_Territory;
+SET vQVD = '$(vLoadFolder)D_Territory_enriched.qvd';
+SET vFieldList = $%Territory_Key_OmniA;
+LET vPrecedingLoad = Null();
+LET vWhereClause = 'Exists(%Territory_Key_OmniA)';
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+///$tab D_Business_Product
+SET ErrorMode=0;
+	drop Table [D_Business_Product];
+SET ErrorMode=1;
+
+SET vTable = D_Business_Product_tmp;
+SET vQVD = '$(vLoadFolder)D_Business_Product_enriched.qvd';
+SET vFieldList = $%Product_BU_Key_OmniA;
+LET vPrecedingLoad = Null();
+LET vWhereClause = 'Exists(%Product_BU_Key_OmniA)';
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause,-1);
+
+D_Business_Product:
+NoConcatenate LOAD
+    *
+    ,1 as _BU2_Standard_SE
+resident D_Business_Product_tmp;
+
+Concatenate(D_Business_Product)
+load
+    *
+    ,null() as _BU2_Standard_SE
+resident D_Business_Product_tmp;
+
+Drop Table D_Business_Product_tmp;
+
+D_BusinessUnit:
+NoConcatenate Load Distinct
+	 BU
+    ,[Business Unit]
+    ,[Business Unit] as [HCP Franchise]
+Resident D_Business_Product;
+
+Drop Fields BU, [Business Unit] From D_Business_Product;
+///$tab D_Timeline
+SET ErrorMode=0;
+	drop Table [D_Timeline];
+SET ErrorMode=1;
+
+///$tab Metadata
+SET ErrorMode=0;
+	drop Table [Metadata];
+SET ErrorMode=1;
+
+// SET vTable = Metadata;
+// SET vQVD = $(vPreLoadFolder)Metadata.qvd;
+// SET vFieldList =Data Source
+//     Data_Set
+//     Last_Reload_Date
+//     Max_Date;
+// LET vPrecedingLoad = Null();
+// LET vWhereClause = Null();
+// call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+  
+///$tab Nprinting
+SET ErrorMode=0;
+	drop Table [Nprinting];
+SET ErrorMode=1;
+
+Nprinting:
+LOAD * INLINE [
+    KPY TYPE, KPI Names
+    WEB, Web Visits
+    WEB, Unique Visitors
+    WEB, Avg Pages per visit
+    Corporate Emails, Sent
+    Corporate Emails, Unique Opens
+    Corporate Emails, Open Rate
+    Corporate Emails, Click Through Rate
+    RTE, Sent_RTE
+    RTE, Unique Opens_RTE
+    RTE, Open Rate_RTE
+    RTE, Click Through Rate_RTE
+    Webinars, Registrations
+    Webinars, #Attended
+    Webinars, Attendance Rate
+];
+
+///$tab Consents recalc
+t:
+load Distinct
+	%Calendar_Key as [%Calendar_Key_t]
+    ,%Account_Key
+    ,%Consent_Key
+//    ,coalesce([%Territory_Key_OmniA],'$(vNATerritory)') as [%Territory_Key_OmniA]
+//    ,coalesce(%Function_Key,'Mix') as %Function_Key
+Resident Facts
+where _DataSource_F_Consent=1;
+
+Inner join (t)
+Load Distinct
+	%Consent_Key
+    ,[Consent Channel Group] as [Consent Email Channel]
+    ,[Consent Type]
+Resident D_Consent
+Where wildmatch([Consent Channel Group],'RTE','Corp@')>0;
+
+inner join (t)
+	Load Distinct
+    	[%Calendar_Key] as [%Calendar_Key_t]
+        ,[Date Num] as [%Calendar_Key]
+    Resident D_Calendar
+    where Day([Date Num])=1;
+
+t_interactions:
+NoConcatenate
+load Distinct
+	num(monthstart(%Calendar_Key)) as [%Calendar_Key]
+    ,%Account_Key
+    ,if(alt(sum(_DataSource_F_RTE_Email),0)>0,1,0) as _Interacted_RTE
+    ,if(alt(sum(_DataSource_F_MC_Email),0)>0,1,0) as _Interacted_MC
+Resident Facts
+where _DataSource_F_RTE_Email=1 or _DataSource_F_MC_Email=1
+group by
+	num(monthstart(%Calendar_Key))
+    ,%Account_Key
+;
+
+t2:
+NoConcatenate Load
+	 %Account_Key
+    ,%Calendar_Key
+//    ,[%Territory_Key_OmniA]
+//    ,%Function_Key
+    ,alt(min(if([Consent Email Channel]='RTE',if([Consent Type] like 'Opt*In',1,if([Consent Type] like 'Opt*Out',2)))),0) as RTEFlag
+    ,alt(min(if([Consent Email Channel]='Corp@',if([Consent Type] like 'Opt*In',1,if([Consent Type] like 'Opt*Out',2)))),0) as CorpFlag
+Resident t
+group by [%Account_Key], [%Calendar_Key];//, [%Territory_Key_OmniA], %Function_Key;
+
+outer join (t2)
+load * resident t_interactions;
+
+Drop Table t_interactions;
+Drop Table t;
+
+t:
+NoConcatenate Load Distinct
+	[%Account_Key]
+    ,[%Country_Key]
+Resident D_Account;
+
+inner join (t)
+load Distinct
+	[%Account_Key]
+from '$(vPreLoadFolder)F_Universe.qvd' (qvd)
+where _IndividualCustomer=1;
+
+inner join(t2)
+Load Distinct
+	[%Account_Key]
+    ,[%Country_Key]
+Resident t;
+
+left join (t)
+	Load Distinct
+    	[Date Num] as [%Calendar_Key]
+    Resident D_Calendar
+    where Day([Date Num])=1;
+
+left join (t)
+	Load Distinct
+    	[%Account_Key]
+        ,[%Territory_Key_OmniA]
+        ,%Function_Key
+    Resident Facts;
+    
+LET vNATerritory = ApplyMap('mTerritory_Key', '#NA'&'|'&'Mix', '#NA'&'|'&'Mix');
+
+outer join (t2)
+	Load Distinct
+    	[%Account_Key]
+        ,[%Calendar_Key]
+	    ,[%Country_Key]
+        ,coalesce([%Territory_Key_OmniA],'$(vNATerritory)') as [%Territory_Key_OmniA]
+        ,coalesce(%Function_Key,'Mix') as %Function_Key
+    Resident t;
+
+drop Table t;
+
+t:
+NoConcatenate Load Distinct
+	[%Country_Key]
+    ,CCorpRequired
+Resident D_Country
+where CCorpRequired = 0;
+
+// left join (t)
+// 	Load Distinct
+//     	[Date Num] as [%Calendar_Key]
+//     Resident D_Calendar
+//     where Day([Date Num])=1;
+
+outer join (t2)
+	Load Distinct
+    	[%Country_Key]
+//         ,[%Calendar_Key]
+        ,CCorpRequired
+    Resident t;
+
+drop Table t;
+
+t:
+NoConcatenate Load Distinct
+	[%Country_Key]
+    ,CRTERequired
+Resident D_Country
+where CRTERequired = 0;
+
+// left join (t)
+// 	Load Distinct
+//     	[Date Num] as [%Calendar_Key]
+//     Resident D_Calendar
+//     where Day([Date Num])=1;
+
+outer join (t2)
+	Load Distinct
+    	[%Country_Key]
+//         ,[%Calendar_Key]
+        ,CRTERequired
+    Resident t;
+
+drop Table t;
+
+Concatenate (Facts)
+Load
+	 [%Account_Key]
+    ,[%Calendar_Key]
+    ,[%Territory_Key_OmniA]
+    ,applymap('m_Target_Customer_MyTarget_Account', %Account_Key,0) as [_Target_Customer_MyTarget_Account]
+    ,applymap('m_Target_Customer_MyTarget_Territory', %Account_Key,0) as [_Target_Customer_MyTarget_Territory]
+    ,coalesce(%Function_Key,'Mix') as %Function_Key
+    ,if((alt(ApplyMap('mConsentEmails',[%Account_Key],0),0)=1 or coalesce(ApplyMap('mAccountEmails',[%Account_Key],null()),'') like '*@*')
+    	and ((alt(CRTERequired,1)=0 and alt(RTEFlag,1)<2) or (alt(CRTERequired,1)=1 and alt(RTEFlag,2)=1)),1,0) as RTEOptIn
+    ,if((alt(ApplyMap('mConsentEmails',[%Account_Key],0),0)=1 or coalesce(ApplyMap('mAccountEmails',[%Account_Key],null()),'') like '*@*')
+    	and ((alt(CCorpRequired,1)=0 and alt(CorpFlag,1)<2) or (alt(CCorpRequired,1)=1 and alt(CorpFlag,2)=1)),1,0) as CorpOptIn
+    ,_Interacted_RTE
+    ,_Interacted_MC
+    ,rangemax(
+    	 if((alt(ApplyMap('mConsentEmails',[%Account_Key],0),0)=1 or coalesce(ApplyMap('mAccountEmails',[%Account_Key],null()),'') like '*@*')
+            and ((alt(CRTERequired,1)=0 and alt(RTEFlag,1)<2) or (alt(CRTERequired,1)=1 and alt(RTEFlag,2)=1)),1,0)
+        ,if((alt(ApplyMap('mConsentEmails',[%Account_Key],0),0)=1 or coalesce(ApplyMap('mAccountEmails',[%Account_Key],null()),'') like '*@*')
+            and ((alt(CCorpRequired,1)=0 and alt(CorpFlag,1)<2) or (alt(CCorpRequired,1)=1 and alt(CorpFlag,2)=1)),1,0)
+        ) as RTECorpOptIn
+    ,rangemax(
+    	 _Interacted_RTE
+    	,_Interacted_MC) as _Interacted_RTE_MC
+Resident t2;
+
+t0:
+NoConcatenate Load distinct
+    [%Calendar_Key]
+resident t2;
+
+left join (t0)
+Load distinct
+    [%Calendar_Key]
+    ,[Date Num]
+resident D_Calendar;
+
+inner join (t2)
+    Load distinct
+        [%Calendar_Key]
+    resident t0
+    where [Date Num]>=MonthStart(today(),-24);
+
+mInteracted:
+Mapping
+Load 
+    [%Account_Key],
+    rangemax(
+    	 _Interacted_RTE
+    	,_Interacted_MC) as _Interacted_RTE_MC
+Resident t2
+where rangemax(
+    	 _Interacted_RTE
+    	,_Interacted_MC)=1
+;
+
+drop Table t0;
+drop Table t2;
+///$tab Cutoff
+t:
+NoConcatenate Load Distinct
+	%Consent_Key
+Resident D_Consent;
+
+left Join (t)
+Load Distinct
+	[%Consent_Key]
+    ,%Calendar_Key
+    ,%Account_Key
+Resident Facts;
+
+left join (t)
+Load
+	[%Calendar_Key]
+    ,max([Date Num]) as [Date Num]
+Resident D_Calendar
+group by [%Calendar_Key];
+
+t:
+Inner Join
+Load
+	[%Account_Key]
+    ,max([Date Num]) as [Date Num]
+Resident t
+Group by [%Account_Key];
+
+t2:
+NoConcatenate Load
+	[Date Num]
+    ,count(distinct [%Account_Key]) as cnt
+Resident t
+Group By
+	[Date Num];
+
+Drop Table t;
+
+t3:
+NoConcatenate Load
+	[Date Num]
+    ,cnt
+    ,rangesum(cnt,Peek('cnt2')) as cnt2
+Resident t2
+Order By [Date Num] desc;
+
+left join (t3)
+Load
+	sum(cnt) as cnt3
+Resident t2;
+
+Drop Table t2;
+
+inner join (t3)
+	Load
+    	max([Date Num]) as [Date Num]
+    Resident t3
+    where cnt2/cnt3>0.95;
+
+let vCutOffDate=peek('Date Num',0,'t3');
+
+Drop Table t3;
+
+
+///$tab D_Calendar_2
+SET ErrorMode=0;
+	drop Table D_Calendar;
+SET ErrorMode=1;
+
+SET vTable = D_Calendar;
+SET vQVD = $(vPreLoadFolder)D_Calendar.qvd;
+SET vFieldList = %Calendar_Key
+    _Consent_Timestamp
+    Date
+    Date Num
+    Month
+    Month Year
+    Month Year Num
+    Quarter
+    Quarter Year
+    Timeframe
+    Week Year
+    Year;
+LET vPrecedingLoad = null();
+SET vWhereClause = exists(%Calendar_Key)
+    and [Year] >= (Year(Today())-2)
+        and [Date Num] <= Today();
+call LoadVerifyQVD(vTable,vQVD,vFieldList,vPrecedingLoad,vWhereClause);
+
+Inner Join (D_Calendar)
+	Load Distinct
+    	[Date Num]
+    Resident D_Calendar
+    Where [Date Num]<=$(vCutOffDate);
+    
+MinMaxDate:
+LOAD
+  MIN([Date Num]) AS MinDate,
+  MAX([Date Num]) AS MaxDate
+Resident D_Calendar;
+
+LET vTimeline_Interactions_MinDate_Script = Peek('MinDate',0,'MinMaxDate');
+LET vTimeline_Interactions_MaxDate_Script = Peek('MaxDate',0,'MinMaxDate');
+
+tmpAsOfCalendar:
+Load distinct [Month Year Num], [Month Year], [Quarter Year]
+  Resident [D_Calendar] ;
+
+Join (tmpAsOfCalendar)
+Load [Month Year Num] as [As-Of Month Year Num], [Month Year] as [As-Of Month Year], [Quarter Year] as [As-Of Quarter Year]
+  Resident tmpAsOfCalendar ;
+
+[As-Of Calendar]:
+Load [Month Year Num],
+  [As-Of Month Year Num],
+  year([As-Of Month Year Num])*12 + month([As-Of Month Year Num]) - year([Month Year Num])*12 - month([Month Year Num]) as MonthDiff,
+  Year([As-Of Month Year Num])-Year([Month Year Num]) as YearDiff,
+  [As-Of Month Year],
+  [As-Of Quarter Year]
+Resident tmpAsOfCalendar
+Where [As-Of Month Year Num] >= [Month Year Num];
+
+Drop Table tmpAsOfCalendar;
+
+///$tab Email Consent
+t:
+NoConcatenate Load
+	%Account_Key
+    ,%Consent_Key
+    ,%Calendar_Key
+Resident Facts;
+
+Left Join (t)
+	Load Distinct
+    	%Consent_Key
+        ,[Consent Channel Type]
+        ,[Consent Type]
+        ,if([Consent Type] like 'Opt*In'
+          ,if(not isnull(pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@'))
+            ,pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@')
+            ,null()
+            )
+          ,if([Consent Type] like 'Opt*Out'
+              ,if(not isnull(pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@'))
+                ,'Opt-Out'
+                ,null()
+                )
+              ,null()
+              )) as t_consent
+        ,if([Consent Type] like 'Opt*Out'
+          ,if(not isnull(pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@'))
+            ,pick(wildmatch([Consent Channel Type],'1:1 Email*','Informational Emails'),'RTE','Corp@')
+            ,null()
+            )
+          ,null()) as t_consent_optout
+	Resident D_Consent;
+
+m_account_valid:
+mapping
+Load Distinct
+    %Account_Key
+    ,Acount_Email_Valid
+Resident D_Account
+where Acount_Email_Valid = 1;
+
+m_consent_optin:
+Mapping Load
+	%Account_Key
+    ,1
+Resident t
+where WildMatch(t_consent,'RTE','Corp@','Opt-Out')>0;
+
+t0:
+NoConcatenate Load
+	%Calendar_Key
+    ,[Date Num]
+Resident D_Calendar;
+
+inner join (t0)
+Load
+	max([Date Num]) as [Date Num]
+Resident t0;
+
+inner join (t)
+Load Distinct
+	%Calendar_Key
+Resident t0;
+
+drop table t0;
+
+m_consent_optout_RTE:
+Mapping Load
+	%Account_Key
+    ,1
+Resident t
+where t_consent_optout='RTE';
+
+m_consent_optout_Corp:
+Mapping Load
+	%Account_Key
+    ,1
+Resident t
+where t_consent_optout='Corp@';
+
+left join (D_Account)
+load Distinct
+	%Country_Key
+    ,CCorpRequired
+    ,CRTERequired
+Resident D_Country;
+
+Concatenate(t)
+Load Distinct
+	%Account_Key
+    ,if(CCorpRequired = 0 and applymap('m_consent_optout_Corp',%Account_Key,0)=0,'Corp@') as t_consent
+Resident D_Account;
+
+Concatenate(t)
+Load Distinct
+	%Account_Key
+    ,if(CRTERequired = 0 and applymap('m_consent_optout_RTE',%Account_Key,0)=0,'RTE') as t_consent
+Resident D_Account;
+
+t2:
+NoConcatenate Load Distinct
+	%Account_Key
+    ,if(applymap('m_account_valid',%Account_Key,0)=1
+        ,if(
+            len(concat(DISTINCT if(WildMatch(t_consent,'RTE','Corp@')>0,t_consent),' & ',WildMatch(t_consent,'Corp@','RTE')))>0
+            ,concat(DISTINCT if(WildMatch(t_consent,'RTE','Corp@')>0,t_consent),' & ',WildMatch(t_consent,'Corp@','RTE'))
+            ,if(
+                len(concat(DISTINCT if(WildMatch(t_consent,'Opt-Out')>0,t_consent),' & ',WildMatch(t_consent,'Opt-Out')))>0
+                ,concat(DISTINCT if(WildMatch(t_consent,'Opt-Out')>0,t_consent),' & ',WildMatch(t_consent,'Opt-Out'))
+                ,if(ApplyMap('m_consent_optin',%Account_Key,0)=1,'Opt-Out','None')
+                ) 
+            )
+        ,'None') as t.ConsentEmail
+Resident t
+group by %Account_Key;
+
+drop Field CCorpRequired from D_Account;
+drop Field CRTERequired from D_Account;
+
+drop table t;
+
+drop field [Email Consent];
+
+left join (D_Account)
+	Load
+    	%Account_Key
+        ,t.ConsentEmail as [Email Consent]
+    Resident t2;
+left join (D_Account)
+	Load
+    	%Account_Key
+        ,applymap('mInteracted',%Account_Key,0) as [Account Interacted]
+    Resident D_Account;
+
+drop Table t2;
+
+inner join (D_Account)
+load
+    0 as [Account Test User]
+autogenerate(1);
+
+inner join (Facts)
+Load distinct
+    %Account_Key
+resident D_Account;
+
+if vAppRegion = '''*''' then
+    store %Account_Key, [Email Consent], [Account Interacted] from D_Account into '$(vLoadFolder)D_Account_Email_Consents.qvd' (qvd);
+endif;
+///$tab Drop Fields
+SET ErrorMode=0;
+//   DROP FIELD [#TimeSpent];
+//   DROP FIELD [%Cycle_Channel_Key];
+//   DROP FIELD [%Fact_Source];
+//   DROP FIELD [%KeyMessage_Key];
+//   DROP FIELD [%MarketingCloud_ClientID];
+//   DROP FIELD [%Medical_Event_Key];
+//   DROP FIELD [%WebRegistration_Key];
+//   DROP FIELD [_ActiveOptInForChannel];
+//   DROP FIELD [_ActiveOptOut];
+//   DROP FIELD [_ActiveOptOutForChannel];
+//   DROP FIELD [_ChannelCriteria];
+//   DROP FIELD [_CLM_Call];
+//   DROP FIELD [_Contact_RelevantChannel];
+//   DROP FIELD [_CurrentEmail];
+//   DROP FIELD [_DomainInScope];
+//   DROP FIELD [_EmailNotRelevant];
+//   DROP FIELD [_Engage_Meeting_Call];
+//   DROP FIELD [_F2FEvent];
+//   DROP FIELD [_FLMCall];
+//   DROP FIELD [_HighPriorityCustomer_CP];
+//   DROP FIELD [_HighPriorityCustomer_Curr];
+//   DROP FIELD [_IndividualCustomer];
+//   DROP FIELD [_KTL_Call];
+//   DROP FIELD [_LevelTeam];
+//   DROP FIELD [_LevelTerritory];
+//   DROP FIELD [_LowPriorityCustomer_CP];
+//   DROP FIELD [_LowPriorityCustomer_Curr];
+//   DROP FIELD [_Medical_Event_Flag];
+//   DROP FIELD [_NewOptIn];
+//   DROP FIELD [_NewOptOut];
+//   DROP FIELD [_Region_Has_F_Activity_FLM];
+//   DROP FIELD [_Region_Has_F_Activity_KAM];
+//   DROP FIELD [_Region_Has_F_Call];
+//   DROP FIELD [_Region_Has_F_Coaching];
+//   DROP FIELD [_Region_Has_F_Consent];
+//   DROP FIELD [_Region_Has_F_MC];
+//   DROP FIELD [_Region_Has_F_Medical_Event];
+//   DROP FIELD [_Region_Has_F_Medical_Event_Attendee];
+//   DROP FIELD [_Region_Has_F_RTE];
+//   DROP FIELD [_Region_Has_F_Target];
+//   DROP FIELD [_Region_Has_F_Target_Detailing];
+//   DROP FIELD [_Region_Has_F_Target_KPIs];
+//   DROP FIELD [_Region_Has_F_Universe];
+//   DROP FIELD [_Region_Has_F_Universe_Not_Linked];
+//   DROP FIELD [_Region_Has_F_Webinar];
+//   DROP FIELD [_Region_Has_F_WebRegistrations];
+//   DROP FIELD [_RepCall];
+//   DROP FIELD [_TargetCustomer];
+//   DROP FIELD [_TargetCustomerProduct];
+//   DROP FIELD [_Team_Cycle_Plan];
+//   DROP FIELD [_Webinar_has_Web_campaign];
+//   DROP FIELD [Account_Key_Original];
+//   DROP FIELD [Appointment_Account_Cnt];
+//   DROP FIELD [Appointment_Cnt];
+//   DROP FIELD [Call Contact Type];
+//   DROP FIELD [Call Id];
+//   DROP FIELD [Campaign Brand];
+//   DROP FIELD [Campaign Communication Objective (Commercial)];   //v1.6.003
+//   DROP FIELD [Campaign Communication Objective (Medical)];   //v1.6.003
+//   DROP FIELD [Campaign Content / Asset (Commercial)];   //v1.6.003
+//   DROP FIELD [Campaign Content / Asset (Medical)];      //v1.6.003
+//   DROP FIELD [Campaign Franchise];
+//   DROP FIELD [Campaign Geographic Market];
+//   DROP FIELD [Campaign Key Message (Commercial)];  //v1.6.003
+//   DROP FIELD [Campaign Key Message (Medical)];     //v1.6.003
+//   DROP FIELD [Campaign Medium (Commercial)];       //v1.6.003
+//   DROP FIELD [Campaign Medium (Medical)];          //v1.6.003
+//   DROP FIELD [Campaign Topic (Commercial)];        //v1.6.003
+//   DROP FIELD [Campaign Topic (Medical)];           //v1.6.003
+//   DROP FIELD [Campaign Type (Commercial)];         //v1.6.003
+//   DROP FIELD [Campaign Type (Medical)];            //v1.6.003
+//   DROP FIELD [CIAM ID];
+//   DROP FIELD [Consent Calc Expiry Date];
+//   DROP FIELD [Consent Channel Label];
+//   DROP FIELD [Consent Channel Source];
+//   DROP FIELD [Consent OptOut Event Type];
+//   DROP FIELD [Consent Sub Channel Name];
+//   DROP FIELD [Country Code];
+//   DROP FIELD [Country Detail name];
+//   DROP FIELD [Country Sort Order];
+//   DROP FIELD [Country_Source];
+//   DROP FIELD [Detailing Position];
+//   DROP FIELD [Detailing_Total_Products];
+//   DROP FIELD [Email Clicked Date];
+//   DROP FIELD [Email Opened Date];
+//   DROP FIELD [Email Outlook Exception];
+//   DROP FIELD [Email Sent Event Date];
+//   DROP FIELD [Email Tagged];
+//   DROP FIELD [EmailID (MC)];
+//   DROP FIELD [Event_AllChannels_Timeline_Cnt];
+//   DROP FIELD [FromName];
+//   DROP FIELD [Function_Sort_Num];
+//   DROP FIELD [Global Brand with Indication];
+//   DROP FIELD [Hit_Cnt];
+//   DROP FIELD [Hits_In_Visit];
+//   DROP FIELD [In_Out_Target];
+//   DROP FIELD [In_Out_Target_Product];
+//   DROP FIELD [Last_File_Timestamp];
+//   DROP FIELD [Met subsitute];
+//   DROP FIELD [Month Year Num];
+//   DROP FIELD [Newsletter_Signup_Cnt];
+//   DROP FIELD [Original_Country];
+//   DROP FIELD [PageViews_In_Visit];
+//   DROP FIELD [Polls_Answered_Cnt];
+//   DROP FIELD [Product Local BU];
+//   DROP FIELD [Product Type];
+//   DROP FIELD [Product_Source];
+//   DROP FIELD [Registration_Signup_Cnt];
+//   DROP FIELD [SBU Name];
+//   DROP FIELD [SMS Exception];
+//   DROP FIELD [Threshold1];
+//   DROP FIELD [Threshold2];
+//   DROP FIELD [Threshold3];
+//   DROP FIELD [Threshold4];
+//   DROP FIELD [Timeline_Channel%];
+//   DROP FIELD [Timeline_Color%];
+//   DROP FIELD [Timeline_Hover%];
+//   DROP FIELD [Timeline_User%];
+//   DROP FIELD [User_benefit_rate];
+//   DROP FIELD [User_Rating];
+//   DROP FIELD [VariableValue];
+//   DROP FIELD [Visitor_Repeat_Cnt];
+//   DROP FIELD [Web Content Name];
+//   DROP FIELD [Web Content Type];
+//   DROP FIELD [Web Content];
+//   DROP FIELD [Web Customer Id];
+//   DROP FIELD [Web Device Type];
+//   DROP FIELD [Web Device];
+//   DROP FIELD [Web Domain in Scope];
+//   DROP FIELD [Web Domain Type (Medical v. Commercial)];
+//   DROP FIELD [Web PDF File Name];
+//   DROP FIELD [Web Referrer];
+//   DROP FIELD [Web Session City];
+//   DROP FIELD [Web Session Country];
+//   DROP FIELD [Web Source File];
+//   DROP FIELD [Web Source Reporting Suite];
+//   DROP FIELD [Web Source];
+//   DROP FIELD [Web Tracking (Campaign ID)];
+//   DROP FIELD [Web Traffic Source Detail];
+//   DROP FIELD [Web Traffic Source Type];
+//   DROP FIELD [Web Video description];
+//   DROP FIELD [Web Video group];
+//   DROP FIELD [Web Video name];
+//   DROP FIELD [Web Visit Duration];
+//   DROP FIELD [Web_Data_Source%];
+//   DROP FIELD [Webinar_FileExtension];
+//   DROP FIELD [WebRegistration_Cnt];
+//   DROP FIELD [zzFormula%];
+//   DROP FIELD [zzFormula_Color%];
+//   DROP FIELD [zzFormula_Icon%];
+//   DROP FIELD [zzFormula_Label%];
+//   DROP FIELD [zzFormula_Name%];
+//   DROP FIELD [Detailing_Cnt];
+//   DROP FIELD [Stream time];
+//   DROP FIELD [Territory Call Performed];
+//   DROP FIELD [Web Referrer Domain];
+//   DROP FIELD [Fact_Source%];
+//   DROP FIELD [_ScientificVisit_Call];
+//   DROP FIELD [Consent Channel Value];
+//   DROP FIELD [_OrganizationCustomer];
+//   DROP FIELD [Sent-to Email Address];
+//   DROP FIELD [Contact Record Type];
+//   DROP FIELD [Email Record Type];
+	 DROP FIELD [Business Unit] FROM D_Segment;
+SET ErrorMode=1;
+///$tab Autonumber
+Rename Field %Function_Key to Function_Key;
+Autonumber '%*';
+Autonumber 'Account_Cnt';
+Rename Field Function_Key to %Function_Key;
+
+///$tab Section Access
+SA_Function:
+NoConcatenate Load Distinct
+	%Function_Key
+Resident Facts;
+
+left join (SA_Function)
+Load Distinct
+	%Function_Key
+    ,'1|'&subfield(if(%Function_Key like 'Mix','COMMERCIAL|MEDICAL',upper(%Function_Key)),'|') as SECTION_ACCESS_FUNCTION
+    ,1 as _FUNC_Standard_SE
+Resident SA_Function;
+
+Concatenate(SA_Function)
+Load Distinct
+	%Function_Key
+    ,'2|'&subfield(if(%Function_Key like 'Mix','COMMERCIAL|MEDICAL',upper(%Function_Key)),'|') as SECTION_ACCESS_FUNCTION
+    ,null() as _FUNC_Standard_SE
+Resident SA_Function;
+
+Section_Access_Prepare_tmp1:
+LOAD Distinct
+    Upper("ACCESS") as "ACCESS",
+    Upper("USERID") as "USERID",
+    Upper(COUNTRY_GROUP) as COUNTRY_GROUP,
+    Upper(BU_GROUP) as BU_GROUP,
+    Upper("FUNCTION") as "USER_FUNCTION",
+	Upper(OMIT_GROUP) as OMIT_GROUP,
+    Upper(FUNCTION_GROUP) as FUNCTION_GROUP,
+    Upper(SHEET_GROUP) as SHEET_GROUP,
+    Upper("ROLE") as "USER_ROLE",
+    UPPER("TERRITORY") as "TERRITORY_GROUP",
+	if(UPPER("FUNCTION") like 'ALL','*',UPPER("FUNCTION")) as SECTION_ACCESS_FUNCTION_TMP1,
+    tmp_APAC_Latam_Champions
+FROM 
+	[$(vFolder_Input_SharePoint)/Access/OneOmniA_Section_Access__TAB_ACCESS.qvd] (qvd)
+;
+
+Left Join(Section_Access_Prepare_tmp1)
+Load * Inline [
+	SECTION_ACCESS_FUNCTION_TMP1, SECTION_ACCESS_FUNCTION_TMP2
+    *,1|COMMERCIAL
+    *,1|MEDICAL
+    COMMERCIAL,1|COMMERCIAL
+    MEDICAL,1|MEDICAL
+    COMMERCIAL,2|MEDICAL
+    MEDICAL,2|COMMERCIAL
+];
+
+Section_Access_Prepare:
+Load
+	ACCESS,
+    USERID,
+    COUNTRY_GROUP,
+    BU_GROUP,
+    "USER_FUNCTION",
+    "USER_ROLE",
+    OMIT_GROUP,
+    FUNCTION_GROUP,
+    SHEET_GROUP,
+    "USER_ROLE" & '|' &  "USER_FUNCTION" & '|' &  COUNTRY_GROUP & '|' & BU_GROUP & '|' & "TERRITORY_GROUP" as SECTION_ACCESS_TERRITORY_LINK,
+    SECTION_ACCESS_FUNCTION_TMP2 as SECTION_ACCESS_FUNCTION,
+    tmp_APAC_Latam_Champions
+Resident
+	Section_Access_Prepare_tmp1
+where   ("USER_ROLE" like 'LOCAL MANAGER')
+    or (("USER_ROLE" like 'LOCAL TEAM') and (SECTION_ACCESS_FUNCTION_TMP2 like '1|*'))
+    or  ("USER_ROLE" like 'LOCAL MARKETING')
+    or  ("USER_ROLE" like 'REGIONAL')
+;
+
+Drop Table Section_Access_Prepare_tmp1;
+
+Section_Access_Country_tmp1:
+NoConcatenate
+LOAD Distinct
+    Upper(COUNTRY_GROUP) as COUNTRY_GROUP,
+    UPPER(SECTION_ACCESS_COUNTRY) as SECTION_ACCESS_COUNTRY
+FROM 
+	[$(vLoadFolder)Section_Access\Section_Access_Country.qvd] (qvd)
+;
+
+concatenate(Section_Access_Country_tmp1)
+LOAD Distinct
+    Upper(COUNTRY_GROUP) as COUNTRY_GROUP,
+    '5|GLOBAL|GLOBAL' as SECTION_ACCESS_COUNTRY
+resident Section_Access_Country_tmp1;
+
+Left Join(Section_Access_Prepare)
+LOAD Distinct
+    COUNTRY_GROUP,
+    SECTION_ACCESS_COUNTRY
+resident Section_Access_Country_tmp1
+;
+
+Drop Table Section_Access_Country_tmp1;
+
+Section_Access_BU_tmp1:
+NoConcatenate
+Load Distinct
+	Upper(BU_GROUP) as BU_GROUP,
+	Upper(BU_NAME) as BU_NAME,
+    '1|'&Upper(BU_NAME) as SECTION_ACCESS_BU,
+    Upper(BU_GROUP)&'|'&Upper(BU_NAME) as SECTION_ACCESS_BU_available
+FROM 
+	[$(vFolder_Input_SharePoint)/Access/OneOmniA_Section_Access__TAB_BU_GROUP.qvd] (qvd)
+;
+
+Concatenate(Section_Access_BU_tmp1)
+Load Distinct
+	'ALL' as BU_GROUP,
+	BU_NAME,
+    '1|'&BU_NAME as SECTION_ACCESS_BU,
+    'ALL'&'|'&BU_NAME as SECTION_ACCESS_BU_available
+Resident Section_Access_BU_tmp1;
+
+Section_Access_BU_tmp2:
+NoConcatenate
+Load Distinct
+	BU_GROUP
+Resident Section_Access_BU_tmp1;
+
+Left Join (Section_Access_BU_tmp2)
+Load Distinct
+	BU_NAME
+Resident Section_Access_BU_tmp1;
+
+Concatenate(Section_Access_BU_tmp1)
+Load Distinct
+	BU_GROUP,
+	BU_NAME,
+    '2|'&BU_NAME as SECTION_ACCESS_BU,
+    BU_GROUP&'|'&BU_NAME as SECTION_ACCESS_BU_available
+Resident Section_Access_BU_tmp2
+Where not Exists(SECTION_ACCESS_BU_available,BU_GROUP&'|'&BU_NAME);
+
+Drop Table Section_Access_BU_tmp2;
+
+Left Join(Section_Access_Prepare)
+LOAD Distinct
+    BU_GROUP,
+    SECTION_ACCESS_BU
+Resident Section_Access_BU_tmp1;
+
+Drop Table Section_Access_BU_tmp1;
+
+Left Join(Section_Access_Prepare)
+LOAD Distinct
+    OMIT_GROUP,
+    OMIT
+FROM 
+	[$(vFolder_Input_SharePoint)/Access/OneOmniA_Section_Access__TAB_OMIT.qvd] (qvd)
+;
+
+Section_Access_Prepare_Terr:
+Load Distinct
+	"ACCESS",
+    "USERID",
+    SECTION_ACCESS_TERRITORY_LINK
+Resident
+	Section_Access_Prepare
+;
+
+Left Join(Section_Access_Prepare_Terr)
+LOAD Distinct
+    Upper(SECTION_ACCESS_TERRITORY_LINK) as SECTION_ACCESS_TERRITORY_LINK,
+    UPPER(SECTION_ACCESS_TERRITORY) as SECTION_ACCESS_TERRITORY
+FROM 
+	[$(vLoadFolder)/Temp/Section_Access_Territory.qvd] (qvd)
+;
+
+/********************************************************************************************************************
+	Use Section Access
+********************************************************************************************************************/
+Star is '*';
+
+Autonumber 'SECTION_ACCESS_*';
+
+Section Access;
+Section_Access:
+Load Distinct
+	"ACCESS",
+    "USERID",
+    Hash128("USERID") AS USERHASHED,
+    OMIT,
+	SECTION_ACCESS_COUNTRY,
+    SECTION_ACCESS_FUNCTION,
+    SECTION_ACCESS_BU,
+    FUNCTION_GROUP,
+    SHEET_GROUP,
+    "USER_ROLE",
+    "USER_FUNCTION"
+Resident
+	Section_Access_Prepare
+;
+
+Section_Access_Prepare2:
+Load Distinct
+	"ACCESS",
+    "USERID",
+    SECTION_ACCESS_TERRITORY
+Resident
+	Section_Access_Prepare_Terr
+;
+
+Section Application;
+
+Access_Level:
+Load Distinct
+	CAPITALIZE("ACCESS") AS [Access Level],
+    Hash128("USERID") AS USERHASHED,
+    SECTION_ACCESS_FUNCTION,
+    CAPITALIZE("USER_ROLE") AS [Access Role],
+    CAPITALIZE(IF(LEN(SECTION_ACCESS_COUNTRY)<3,NULL(), SUBFIELD(SECTION_ACCESS_COUNTRY,'|',-1))) AS [Access Country],
+    CAPITALIZE(SUBFIELD(SECTION_ACCESS_BU,'|',-1)) AS [Access BU],
+    if(isnull(trim(tmp_APAC_Latam_Champions)),2,tmp_APAC_Latam_Champions) as TMP_APAC_LATAM_MASHUP
+Resident
+	Section_Access_Prepare;
+    
+Access_Omits:
+Load Distinct
+    Hash128("USERID") AS USERHASHED,
+    OMIT as [Access Omit]
+Resident
+	Section_Access_Prepare;
+   
+Drop Table Section_Access_Prepare;
+Drop Table Section_Access_Prepare_Terr;
+
+left join (Access_Level)
+Load Distinct
+	SECTION_ACCESS_FUNCTION as SECTION_ACCESS_FUNCTION
+    ,CAPITALIZE(%Function_Key) AS [Access Function]
+Resident SA_Function
+Where _FUNC_Standard_SE=1;
+
+Drop Field SECTION_ACCESS_FUNCTION From Access_Level;
+SET vAccessOmits = '=concat({1} distinct replace(''[{TRG}]'',''{TRG}'',[Access Omit]),''|'',[Access Omit])';
+///$tab Exit Script
+tag field Function, FunctionSelector, Permissions with $hidden;
+Exit Script;
