@@ -1,0 +1,13 @@
+{
+    // See https://go.microsoft.com/fwlink/?LinkId=733558
+    // for the documentation about the tasks.json format
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "ZIP",
+            "type": "shell",
+            "command": "git pull; $files=Get-ChildItem -Path 'yaml_agent' -Filter '*.py' -Recurse | Select-Object -ExpandProperty FullName; $files+=$(Resolve-Path 'cli.py').Path; Compress-Archive -Path $files -DestinationPath 'yaml_agent.zip' -Force",
+            "problemMatcher": []
+        }
+    ]
+}
