@@ -15,7 +15,7 @@ Also includes:
       • Missing semicolons on DML statements (multiline-aware)
       • Hardcoded dates in LET
       • Nested IF depth within data-load statements
-      • LOAD … FROM *.qvd outside any SUB that itself contains a QVD load (even when split across lines)
+      • Any static path (literal or variable→literal with full file path) in LOAD … FROM … .qvd must be flagged
       • SUB parameters used as file paths must start with lib:// or $(…)
       • Per-line, incremental variable resolution when checking SUB path parameters
 """
@@ -66,14 +66,13 @@ def check_master_measures_and_variables(repo_root: str) -> List[Dict]:
 
 
 #
-# Part 2: Inline-SUB & QVD-usage checks (printed to stdout)
+# Part 2: Inline-SUB & QVD-usage checks
 #
 
 def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
     """
     Scan a QVS script for:
       - SUB definitions and their parameters
-      - QVD usage inside any SUB (valid context)
       - Variables passed to SUB path parameters must start with lib:// or $(…)
       - Per-line, incremental variable resolution
     Returns a list of warning dicts.
@@ -84,24 +83,19 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
     except Exception:
         return warnings
 
-    total_lines = len(lines)
-
-    # 1) Parse all SUB definitions: name → parameter list; also gather body lines and ranges
+    # 1) Parse all SUB definitions: name → parameter list; also gather body lines
     sub_def_pattern = re.compile(r"^\s*SUB\s+(\w+)\s*\((.*?)\)", flags=re.IGNORECASE)
     end_sub_pattern = re.compile(r"^\s*END\s+SUB\b", flags=re.IGNORECASE)
 
     sub_params: Dict[str, List[str]] = {}
     sub_bodies: Dict[str, List[str]] = {}
-    sub_ranges: Dict[str, tuple] = {}  # SUB name -> (start_idx, end_idx)
     in_sub: Optional[str] = None
-    start_idx = 0
     current_body: List[str] = []
 
     for idx, raw in enumerate(lines):
         if in_sub:
             if re.match(end_sub_pattern, raw):
                 sub_bodies[in_sub] = current_body.copy()
-                sub_ranges[in_sub] = (start_idx, idx)
                 in_sub = None
                 current_body = []
             else:
@@ -114,18 +108,9 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
                 params = [p.strip() for p in param_str.split(",")] if param_str else []
                 sub_params[name] = params
                 in_sub = name
-                start_idx = idx
                 current_body = []
 
-    # 2) Identify which SUBs contain any QVD-load (i.e., “FROM … .qvd” in body)
-    sub_ranges_with_qvd: List[tuple] = []
-    for sub_name, body_lines in sub_bodies.items():
-        for line in body_lines:
-            if re.search(r"\bFROM\b.*\.qvd", line, flags=re.IGNORECASE):
-                sub_ranges_with_qvd.append(sub_ranges[sub_name])
-                break  # only need one occurrence to consider that SUB valid
-
-    # 3) Identify which SUB parameters are used in FROM [$(param)] inside their SUB bodies
+    # 2) Identify which SUB parameters are used in FROM [$(param)] inside their bodies
     sub_params_used_as_path: Dict[str, Set[str]] = {}
     for sub_name, params in sub_params.items():
         used: Set[str] = set()
@@ -139,7 +124,7 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
         if used:
             sub_params_used_as_path[sub_name] = used
 
-    # 4) Incrementally track per-line variable assignments
+    # 3) Incrementally track per-line variable assignments
     var_assignments: Dict[str, str] = {}
     assign_pattern = re.compile(r"^\s*SET\s+(\w+)\s*=\s*(.+?);", flags=re.IGNORECASE)
     call_pattern = re.compile(r"^\s*call\s+(\w+)\s*\((.*?)\)", flags=re.IGNORECASE)
@@ -160,14 +145,14 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
         return val
 
     for idx, raw in enumerate(lines):
-        # 4a) Record any SET var = … assignments
+        # Record SET assignments
         m_assign = assign_pattern.match(raw)
         if m_assign:
             var_name = m_assign.group(1)
             value = m_assign.group(2).strip()
             var_assignments[var_name] = value
 
-        # 4b) Check any call to a SUB that has path parameters
+        # Check SUB calls with path parameters
         m_call = call_pattern.match(raw)
         if not m_call:
             continue
@@ -183,7 +168,6 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
         for pos, param_name in enumerate(params):
             if param_name in path_params and pos < len(args):
                 arg = args[pos]
-                # Case A: literal string in single quotes
                 lit_match = re.match(r"^'(.*)'$", arg)
                 if lit_match:
                     literal = lit_match.group(1).strip()
@@ -195,50 +179,30 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
                             "statement": raw.rstrip(),
                         })
                 else:
-                    # Case B: a simple variable name (e.g. vQVD)
                     var_match = re.match(r"^([A-Za-z_]\w*)$", arg)
                     if var_match:
                         resolved = resolve_var(var_match.group(1), var_assignments.copy(), set())
                         if resolved is not None:
+                            # Remove quotes if present
                             lit2 = re.match(r"^'(.*)'$", resolved)
                             if lit2:
                                 literal2 = lit2.group(1).strip()
-                                if not (literal2.lower().startswith("lib://") or
-                                        re.match(r"\$\([A-Za-z0-9_]+\)", literal2)):
-                                    warnings.append({
-                                        "line": idx + 1,
-                                        "issue": f"Hardcoded literal '{literal2}' (via variable) passed to parameter '{param_name}'. Use lib:// or a variable.",
-                                        "statement": raw.rstrip(),
-                                    })
                             else:
-                                # If resolution yields a raw lib:// path, that's not allowed here
-                                if resolved.lower().startswith("lib://"):
-                                    warnings.append({
-                                        "line": idx + 1,
-                                        "issue": f"Hardcoded SUB path literal '{resolved}' passed to parameter '{param_name}'. Use a variable or dynamic expression.",
-                                        "statement": raw.rstrip(),
-                                    })
-                                elif re.match(r"^\$\([A-Za-z0-9_]+\).*$", resolved):
-                                    pass  # Valid dynamic expression
-                                else:
-                                    warnings.append({
-                                        "line": idx + 1,
-                                        "issue": f"Parameter '{param_name}' passed via variable chain to expression '{resolved}'. Verify path conforms to rules.",
-                                        "statement": raw.rstrip(),
-                                    })
+                                literal2 = resolved.strip()
+                            # Only flag if literal2 is a complete lib:// path ending with extension
+                            if re.match(r"^lib://.*\.\w+$", literal2, flags=re.IGNORECASE):
+                                warnings.append({
+                                    "line": idx + 1,
+                                    "issue": f"Static path '{literal2}' passed to parameter '{param_name}'.",
+                                    "statement": raw.rstrip(),
+                                })
+                            # Otherwise, dynamic enough
                         else:
-                            warnings.append({
-                                "line": idx + 1,
-                                "issue": f"Unable to resolve variable '{var_match.group(1)}' passed to parameter '{param_name}'.",
-                                "statement": raw.rstrip(),
-                            })
+                            # Unresolved var → dynamic enough
+                            pass
                     else:
-                        # Case C: a more complex expression—prompt manual review
-                        warnings.append({
-                            "line": idx + 1,
-                            "issue": f"Parameter '{param_name}' passed via expression '{arg}'. Verify path conforms to rules.",
-                            "statement": raw.rstrip(),
-                        })
+                        # Complex expression → dynamic enough
+                        pass
 
     return warnings
 
@@ -250,10 +214,7 @@ def check_subs_and_qvd_usage(script_path: str) -> List[Dict]:
 def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
     """
     Enhanced QVS script linter that enforces:
-      - All FROM clauses must use lib:// or a variable
-      - If any SUB contains a QVD-load (i.e. “FROM … .qvd”), then LOAD … FROM … .qvd inside that SUB is valid;
-        any multi-line “LOAD … FROM … .qvd” outside every such SUB is flagged.
-        If no SUB contains a QVD-load, then no warning is raised for any LOAD … FROM … .qvd.
+      - Any static path (literal or variable→literal with full file path) in LOAD … FROM … .qvd must be flagged
       - Warn on SELECT * usage
       - Warn on missing semicolons on DML statements (multiline-aware)
       - Warn on hardcoded dates in LET
@@ -269,38 +230,26 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
 
     total_lines = len(lines)
 
-    # 1) Parse SUB definitions again to find ranges of any SUB that contains a QVD-load
-    sub_ranges_with_qvd: List[tuple] = []
-    sub_def_pattern = re.compile(r"^\s*SUB\s+(\w+)\s*\(", flags=re.IGNORECASE)
-    end_sub_pattern = re.compile(r"^\s*END\s+SUB\b", flags=re.IGNORECASE)
-
-    in_sub: Optional[str] = None
-    current_body: List[str] = []
-    current_start: int = 0
-
-    for idx, raw in enumerate(lines):
-        if in_sub:
-            if re.match(end_sub_pattern, raw):
-                body_text = "".join(current_body)
-                if re.search(r"\bFROM\b.*\.qvd", body_text, flags=re.IGNORECASE):
-                    sub_ranges_with_qvd.append((current_start, idx))
-                in_sub = None
-                current_body = []
-            else:
-                current_body.append(raw)
-        else:
-            m = sub_def_pattern.match(raw)
-            if m:
-                in_sub = m.group(1)
-                current_start = idx
-                current_body = []
-
-    # 2) Patterns for general checks
     select_star_pattern = re.compile(r"SELECT\s+\*", flags=re.IGNORECASE)
     dml_start_pattern = re.compile(r"^\s*(SELECT|LOAD|STORE|INSERT|DELETE|JOIN)\b", flags=re.IGNORECASE)
     load_select_pattern = re.compile(r"^\s*(LOAD|SELECT)\b", flags=re.IGNORECASE)
     hardcoded_date_pattern = re.compile(r"^\s*LET\s+\w+\s*=\s*\d{4}", flags=re.IGNORECASE)
     lowercase_keyword_pattern = re.compile(r"\b(load|select|join|where|set|let|store|insert|delete|qualify)\b")
+
+    var_assignments: Dict[str, str] = {}
+    assign_pattern = re.compile(r"^\s*SET\s+(\w+)\s*=\s*(.+?);", flags=re.IGNORECASE)
+
+    def resolve_var(var_name: str, assignments: Dict[str, str], seen: Set[str]) -> Optional[str]:
+        if var_name in seen:
+            return None
+        seen.add(var_name)
+        val = assignments.get(var_name)
+        if val is None:
+            return None
+        m = re.match(r"^([A-Za-z_]\w*)$", val)
+        if m:
+            return resolve_var(m.group(1), assignments, seen)
+        return val
 
     idx = 0
     in_load_context = False
@@ -314,10 +263,16 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
         lineno = idx + 1
         line = raw.rstrip()
 
-        # Determine if this is a comment line
+        # Track SET assignments for variable resolution
+        m_assign = assign_pattern.match(line)
+        if m_assign:
+            var_name = m_assign.group(1)
+            value = m_assign.group(2).strip()
+            var_assignments[var_name] = value
+
         is_comment = line.lstrip().startswith("//") or line.lstrip().startswith("/*")
 
-        # 3) SELECT * usage
+        # SELECT * usage
         if select_star_pattern.search(line):
             warnings.append({
                 "line": lineno,
@@ -325,7 +280,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                 "statement": line
             })
 
-        # 4) Hardcoded date in LET
+        # Hardcoded date in LET
         if hardcoded_date_pattern.match(line):
             warnings.append({
                 "line": lineno,
@@ -333,7 +288,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                 "statement": line
             })
 
-        # 5) Uppercase enforcement for keywords (skip within comment lines)
+        # Uppercase enforcement for keywords
         if not is_comment and lowercase_keyword_pattern.search(line):
             warnings.append({
                 "line": lineno,
@@ -341,7 +296,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                 "statement": line
             })
 
-        # 6) FROM clause path check: single-line literal must start with lib:// or $(…)
+        # Single-line FROM 'literal'
         m_from_literal = re.search(r"\bFROM\s+'([^']+)'", line, flags=re.IGNORECASE)
         if m_from_literal:
             path = m_from_literal.group(1).strip()
@@ -352,7 +307,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                     "statement": line
                 })
 
-        # 7) Detect multi-line “LOAD … FROM … .qvd”
+        # Multi-line LOAD/SELECT detection
         if re.match(r"^\s*(LOAD|SELECT)\b", line, flags=re.IGNORECASE):
             block_lines = [line]
             j = idx + 1
@@ -365,24 +320,47 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                 j += 1
 
             full_block = " ".join(block_lines)
-            if re.search(r"\bFROM\b.*\.qvd", full_block, flags=re.IGNORECASE):
-                # Only flag if there is at least one SUB that contains a QVD-load.
-                if sub_ranges_with_qvd:
-                    inside_valid_sub = False
-                    for (start, end) in sub_ranges_with_qvd:
-                        if start <= idx <= end:
-                            inside_valid_sub = True
-                            break
-                    if not inside_valid_sub:
+            # Match FROM [ ... ] inside the bracket
+            m_from = re.search(r"\bFROM\s*\[\s*([^\]]+)\s*\]", full_block, flags=re.IGNORECASE)
+            if m_from:
+                path_inner = m_from.group(1).strip()
+                # Case A: exactly "$(var)"
+                var_exact = re.match(r"^\$\((\w+)\)$", path_inner)
+                if var_exact:
+                    var_name = var_exact.group(1)
+                    resolved = resolve_var(var_name, var_assignments.copy(), set())
+                    if resolved is not None:
+                        # Remove any surrounding quotes
+                        lit_match = re.match(r"^'(.*)'$", resolved)
+                        if lit_match:
+                            literal = lit_match.group(1).strip()
+                        else:
+                            literal = resolved.strip()
+                        # Only flag if literal is a complete lib:// path ending in a file extension
+                        if re.match(r"^lib://.*\.\w+$", literal, flags=re.IGNORECASE):
+                            warnings.append({
+                                "line": lineno,
+                                "issue": f"Static path '{literal}' used in LOAD … FROM … .qvd (via variable).",
+                                "statement": full_block,
+                            })
+                        # Otherwise (e.g. lib://OmniA/ without extension), consider dynamic enough
+                    else:
+                        # Unresolved variable: dynamic enough, do not flag
+                        pass
+                else:
+                    # Case B: not exactly "$(var)". If starts with lib:// and ends with extension → static
+                    if re.match(r"^lib://.*\.\w+$", path_inner, flags=re.IGNORECASE):
                         warnings.append({
                             "line": lineno,
-                            "issue": "LOAD … FROM … qvd appears outside any SUB that uses QVD in its body.",
+                            "issue": f"Static path '{path_inner}' used in LOAD … FROM … .qvd.",
                             "statement": full_block,
                         })
+                    # Otherwise (e.g. "$(var)/suffix" or other combination), dynamic enough
+
             idx = j
             continue
 
-        # 8) Track nested IF depth inside data-load blocks
+        # Nested IF tracking within data-load
         if not in_load_context and load_select_pattern.match(line):
             if not line.endswith(";"):
                 in_load_context = True
@@ -409,7 +387,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
                     })
                 in_load_context = False
 
-        # 9) DML missing semicolon check (LOAD/SELECT/STORE/INSERT/DELETE/JOIN)
+        # DML missing semicolon check
         if dml_start_pattern.match(line):
             if not line.endswith(";"):
                 snippet_lines = [line]
@@ -435,7 +413,7 @@ def run_script_linter(script_path: str, out_dir: str) -> List[Dict]:
 
         idx += 1
 
-    # 10) Write YAML if any warnings exist
+    # Write YAML if warnings exist
     if warnings:
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, "script_lint.yaml")
