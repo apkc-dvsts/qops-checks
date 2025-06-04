@@ -1,252 +1,290 @@
 #!/usr/bin/env python3
 """
 check_subs_qvd_usage.py
+=======================
 
-Scans a QVS script for:
-  - SUB definitions and their parameters
-  - Which SUBs contain QVD loads (i.e., “FROM … .qvd” in their body)
-  - Flags any “LOAD … FROM … .qvd” outside those SUB ranges (even if spread over multiple lines)
-  - Ensures SUB parameters representing file paths are passed as lib:// or $(…)
-  - Performs per-line, incremental variable resolution for SUB path parameters
+Rule
+----
+• Every final `LOAD … (qvd)` must reside inside a *QVD-verifying loader SUB*.
+• If the script contains **zero** such SUBs, the rule is silent.
+• A SUB is *verifying* when it keeps at least one produced table
+  **and** either
+      – calls  QvdNoOfFields( / QvdFieldName( ),  **or**
+      – contains a literal  FROM … (qvd|.qvd)  load.
+
+“Produced tables” include
+  • aliases loaded from a QVD,
+  • aliases **stored** into a new QVD (`STORE alias INTO … (qvd)`),
+  • parameters whose names contain “table”.
+
+Exports
+-------
+    weight : int
+    run(script_path) -> List[Dict]
+
+Logging
+-------
+Each SUB is logged (INFO) as:
+
+    SUB <name> → verifier / non-verifier
+          (QvdCalls=Y/N, Stores=Y/N, KeepsTable=Y/N)
 """
 
-import os
+from __future__ import annotations
+import logging
 import re
-from typing import List, Dict, Optional, Set
+from pathlib import Path
+from typing import Dict, List, Optional, Set
 
-# Module weight for ordering in best-practices checks
-weight = 8
+# ---------------------------------------------------------------------------
+# configuration
+# ---------------------------------------------------------------------------
+NEGATIVE_KEYWORDS: tuple[str, ...] = (
+    "reaggr", "reagg", "aggregate", "reprocess",
+    "process",    # ⬅ added
+    "recalc", "pivot", "refresh", "transform",
+)
+weight = 8  # ordering priority
 
-def run(script_path: str) -> List[Dict]:
-    """
-    Entrypoint for the lint framework. Returns a list of warning dicts:
-      { "line": int, "issue": str, "statement": str }.
-    """
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _strip_comments(line: str, in_block: bool) -> tuple[str, bool]:
+    """Remove // … and /* … */ comments (supports nested block comments)."""
+    i, out = 0, []
+    while i < len(line):
+        if in_block:
+            end = line.find("*/", i)
+            if end == -1:
+                return "", True
+            i = end + 2
+            in_block = False
+        else:
+            dbl = line.find("//", i)
+            blk = line.find("/*", i)
+            if dbl == blk == -1:
+                out.append(line[i:])
+                break
+            if dbl != -1 and (blk == -1 or dbl < blk):
+                out.append(line[i:dbl])
+                break
+            out.append(line[i:blk])
+            i = blk + 2
+            in_block = True
+    return "".join(out), in_block
+
+
+def _resolve_chain(var: str, assigns: Dict[str, str], seen: Set[str]) -> Optional[str]:
+    """Follow LET/SET chains until a literal/lib:///$(…) expression."""
+    if var in seen:
+        return None
+    seen.add(var)
+    val = assigns.get(var)
+    if val is None:
+        return None
+    m = re.match(r"^([A-Za-z_]\w*)$", val)
+    return _resolve_chain(m.group(1), assigns, seen) if m else val
+
+# ---------------------------------------------------------------------------
+# main rule
+# ---------------------------------------------------------------------------
+def run(script_path: str | Path) -> List[Dict]:
     warnings: List[Dict] = []
+
+    script_path = Path(script_path)
     try:
-        with open(script_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception:
+        raw_lines = script_path.read_text(encoding="utf-8").splitlines()
+    except Exception as exc:  # pragma: no cover
+        log.error("Cannot read %s: %s", script_path, exc)
         return warnings
 
-    total_lines = len(lines)
+    # 0) strip comments
+    lines, in_block = [], False
+    for raw in raw_lines:
+        clean, in_block = _strip_comments(raw, in_block)
+        lines.append(clean)
 
-    # -------------------------------------------------------------------------
-    # 1) Parse all SUB definitions: name → params; also collect body lines and (start, end) indices.
-    # -------------------------------------------------------------------------
-    sub_def_pattern = re.compile(r"^\s*SUB\s+(\w+)\s*\((.*?)\)", flags=re.IGNORECASE)
-    end_sub_pattern = re.compile(r"^\s*END\s+SUB\b", flags=re.IGNORECASE)
+    # 1) SUB boundaries & params
+    sub_def_rx = re.compile(r"^\s*SUB\s+(\w+)\s*\((.*?)\)", re.I)
+    sub_end_rx = re.compile(r"^\s*END\s+SUB\b", re.I)
+    sub_ranges, sub_bodies, sub_params = {}, {}, {}
 
-    sub_params: Dict[str, List[str]] = {}
-    sub_bodies: Dict[str, List[str]] = {}
-    sub_ranges: Dict[str, tuple] = {}  # sub_name → (start_idx, end_idx)
     in_sub: Optional[str] = None
-    start_idx: int = 0
-    current_body: List[str] = []
+    body: List[str] = []
+    start_idx = 0
 
-    for idx, raw in enumerate(lines):
+    for idx, ln in enumerate(lines):
         if in_sub:
-            if end_sub_pattern.match(raw):
-                sub_bodies[in_sub] = current_body.copy()
+            if sub_end_rx.match(ln):
+                sub_bodies[in_sub] = body.copy()
                 sub_ranges[in_sub] = (start_idx, idx)
-                in_sub = None
-                current_body = []
+                in_sub, body = None, []
             else:
-                current_body.append(raw)
+                body.append(ln)
         else:
-            m = sub_def_pattern.match(raw)
-            if m:
-                name = m.group(1)
+            if (m := sub_def_rx.match(ln)):
+                in_sub = m.group(1)
                 param_str = m.group(2).strip()
                 params = [p.strip() for p in param_str.split(",")] if param_str else []
-                sub_params[name] = params
-                in_sub = name
-                start_idx = idx
-                current_body = []
+                sub_params[in_sub] = params
+                start_idx, body = idx, []
 
-    # -------------------------------------------------------------------------
-    # 2) Identify which SUBs contain any QVD-load (“FROM … .qvd”) in their body.
-    # -------------------------------------------------------------------------
-    sub_ranges_with_qvd: List[tuple] = []
-    for sub_name, body_lines in sub_bodies.items():
-        for line in body_lines:
-            if re.search(r"\bFROM\b.*\.qvd", line, flags=re.IGNORECASE):
-                sub_ranges_with_qvd.append(sub_ranges[sub_name])
-                break
+    # 2) classify verifier SUBs
+    qvd_load_rx  = re.compile(r"\bFROM\b.*(\.qvd\b|\(\s*qvd\s*\))", re.I)
+    verify_fn_rx = re.compile(r"(QvdNoOfFields|QvdFieldName)\s*\(", re.I)
+    alias_lbl_rx = re.compile(r"^\s*(\w+)\s*:\s*$", re.I)         # Alias:
+    concat_rx    = re.compile(r"\bCONCATENATE\s*\(\s*(\w+)\s*\)", re.I)
+    # ← NEW: capture alias inside [], quotes, or bare identifier
+    store_rx     = re.compile(
+        r"""^\s*STORE\s+
+            (?:
+              \[\s*([^\]]+?)\s*\]     |   # [alias]
+              "([^"]+)"               |   # "alias"
+              (\w+)                       # bare alias
+            )
+            \s+INTO\b.*\(qvd\)""",
+        re.I | re.X,
+    )
+    drop_rx      = re.compile(r"^\s*DROP\s+TABLE\s+(\w+)\b", re.I)
 
-    # -------------------------------------------------------------------------
-    # 3) For each SUB, find which parameters are used inside a “FROM [$(param)]” in its body.
-    #    We only enforce path validation for those parameters.
-    # -------------------------------------------------------------------------
-    sub_params_used_as_path: Dict[str, Set[str]] = {}
-    for sub_name, params in sub_params.items():
-        used: Set[str] = set()
-        body_lines = sub_bodies.get(sub_name, [])
-        for param in params:
-            pattern = re.compile(rf"\bFROM\s+\[\$\(\s*{re.escape(param)}\s*\)\]", flags=re.IGNORECASE)
-            for line in body_lines:
-                if pattern.search(line):
-                    used.add(param)
-                    break
-        if used:
-            sub_params_used_as_path[sub_name] = used
+    verifier_ranges: List[tuple[int, int]] = []
 
-    # -------------------------------------------------------------------------
-    # 4) Incrementally track per-line variable assignments (LET/SET) to resolve parameters.
-    # -------------------------------------------------------------------------
-    var_assignments: Dict[str, str] = {}
-    assign_pattern = re.compile(r"^\s*(LET|SET)\s+(\w+)\s*=\s*(.+?);", flags=re.IGNORECASE)
-    call_pattern = re.compile(r"^\s*CALL\s+(\w+)\s*\((.*?)\)", flags=re.IGNORECASE)
+    for sub, (s_idx, e_idx) in sub_ranges.items():
+        body = sub_bodies[sub]
+        lower_name = sub.lower()
 
-    def resolve_var(var_name: str, assignments: Dict[str, str], seen: Set[str]) -> Optional[str]:
-        """
-        Recursively resolve var_name through assignments dict.
-        Avoid infinite loops by tracking 'seen'.
-        """
-        if var_name in seen:
-            return None
-        seen.add(var_name)
-        val = assignments.get(var_name)
-        if val is None:
-            return None
-        m = re.match(r"^([A-Za-z_]\w*)$", val)
-        if m:
-            return resolve_var(m.group(1), assignments, seen)
-        return val
-
-    # -------------------------------------------------------------------------
-    # 5) Scan each line:
-    #    a) Record any LET/SET assignments.
-    #    b) If it's a SUB call to a SUB with “qvd” parameters, validate each argument.
-    # -------------------------------------------------------------------------
-    for idx, raw in enumerate(lines):
-        line_no = idx + 1
-
-        # 5a) Record LET/SET:  LET var = value;  or  SET var = value;
-        m_assign = assign_pattern.match(raw)
-        if m_assign:
-            var_name = m_assign.group(2)
-            value = m_assign.group(3).strip()
-            var_assignments[var_name] = value
-
-        # 5b) Check calls: CALL SubName(arg1, arg2, …)
-        m_call = call_pattern.match(raw)
-        if not m_call:
-            continue
-        sub_name = m_call.group(1)
-        args_str = m_call.group(2).strip()
-        if sub_name not in sub_params_used_as_path:
+        if any(kw in lower_name for kw in NEGATIVE_KEYWORDS):
+            log.info("SUB %-30s → non-verifier (negative name)", sub)
             continue
 
-        args = [arg.strip() for arg in re.split(r"\s*,\s*", args_str) if arg.strip() != ""]
-        params = sub_params.get(sub_name, [])
-        path_params = sub_params_used_as_path[sub_name]
+        has_verify_call = any(verify_fn_rx.search(l) for l in body)
 
-        for pos, param_name in enumerate(params):
-            if param_name not in path_params or pos >= len(args):
+        produced, dropped = set(), set()
+        current_alias: Optional[str] = None
+        has_literal_qvd = False
+        has_store = False
+
+        # Add param aliases containing "table"
+        produced.update(p for p in sub_params[sub] if "table" in p.lower())
+
+        for ln in body:
+            if (m := alias_lbl_rx.match(ln)):
+                current_alias = m.group(1)
+                continue
+            if (m := concat_rx.search(ln)):
+                current_alias = m.group(1)
+
+            if qvd_load_rx.search(ln):
+                has_literal_qvd = True
+                if current_alias:
+                    produced.add(current_alias)
+
+            if (m := store_rx.match(ln)):
+                alias = m.group(1) or m.group(2) or m.group(3)
+                produced.add(alias)
+                has_store = True
+
+            if (m := drop_rx.match(ln)):
+                dropped.add(m.group(1))
+
+        keeps_table = bool(produced - dropped)
+        is_verifier = keeps_table and (has_verify_call or has_literal_qvd)
+
+        log.info(
+            "SUB %-30s → %-12s  (QvdCalls=%s, Stores=%s, KeepsTable=%s)",
+            sub,
+            "verifier" if is_verifier else "non-verifier",
+            "Y" if has_verify_call else "N",
+            "Y" if has_store else "N",
+            "Y" if keeps_table else "N",
+        )
+
+        if is_verifier:
+            verifier_ranges.append((s_idx, e_idx))
+
+    # If no verifier – rule silent
+    if not verifier_ranges:
+        log.info("➡  No QVD-verifying SUB present – outer-LOAD rule disabled.")
+        return warnings
+
+    # 3) collect SET/LET and path-parameters
+    assigns: Dict[str, str] = {}
+    assign_rx = re.compile(r"^\s*(LET|SET)\s+(\w+)\s*=\s*(.+?);", re.I)
+    call_rx   = re.compile(r"^\s*CALL\s+(\w+)\s*\((.*?)\)", re.I)
+    path_param_rx = re.compile(r"\bFROM\s+\[\$\(\s*([A-Za-z_]\w*)\s*\)\]", re.I)
+
+    for ln in lines:
+        if (m := assign_rx.match(ln)):
+            assigns[m.group(2)] = m.group(3).strip()
+
+    path_params: Dict[str, Set[str]] = {
+        sub: {m.group(1) for l in body for m in path_param_rx.finditer(l)}
+        for sub, body in sub_bodies.items()
+    }
+
+    def warn(idx: int, issue: str, stmt: str) -> None:
+        warnings.append({"line": idx + 1, "issue": issue, "statement": stmt})
+
+    # 4) validate CALL … arg paths
+    for idx, ln in enumerate(lines):
+        if not (m := call_rx.match(ln)):
+            continue
+        sub, arg_str = m.group(1), m.group(2).strip()
+        if sub not in path_params or not path_params[sub]:
+            continue
+
+        args = [a.strip() for a in re.split(r"\s*,\s*", arg_str) if a.strip()]
+        for pos, param in enumerate(sub_params[sub]):
+            if param not in path_params[sub] or pos >= len(args):
                 continue
             arg = args[pos]
 
-            # Case A: literal in single quotes
-            lit_match = re.match(r"^'(.*)'$", arg)
-            if lit_match:
-                literal = lit_match.group(1).strip()
-                if not (literal.lower().startswith("lib://") or
-                        re.match(r"^\$\([A-Za-z0-9_]+\)", literal)):
-                    warnings.append({
-                        "line": line_no,
-                        "issue": f"Hardcoded SUB path literal '{literal}' passed to parameter '{param_name}'. Use lib:// or a variable.",
-                        "statement": raw.rstrip(),
-                    })
+            # literal
+            if (lit := re.match(r"^'(.*)'$", arg)):
+                v = lit.group(1).strip()
+                if not (v.lower().startswith("lib://") or re.match(r"^\$\([A-Za-z0-9_]+\)", v)):
+                    warn(idx, f"Hard-coded path '{v}' passed to '{param}'.", ln)
                 continue
 
-            # Case B: simple variable name
-            var_match = re.match(r"^([A-Za-z_]\w*)$", arg)
-            if var_match:
-                var_name = var_match.group(1)
-                resolved = resolve_var(var_name, var_assignments.copy(), set())
-                if resolved:
-                    # If resolution yields a literal in quotes
-                    lit2 = re.match(r"^'(.*)'$", resolved)
-                    if lit2:
-                        literal2 = lit2.group(1).strip()
-                        if not (literal2.lower().startswith("lib://") or
-                                re.match(r"^\$\([A-Za-z0-9_]+\)", literal2)):
-                            warnings.append({
-                                "line": line_no,
-                                "issue": f"Hardcoded literal '{literal2}' (via variable) passed to parameter '{param_name}'. Use lib:// or a variable.",
-                                "statement": raw.rstrip(),
-                            })
-                    else:
-                        # If resolution yields a raw lib:// path, it is considered hardcoded here
-                        if resolved.lower().startswith("lib://"):
-                            warnings.append({
-                                "line": line_no,
-                                "issue": f"Hardcoded SUB path literal '{resolved}' passed to parameter '{param_name}'. Use a variable or dynamic expression.",
-                                "statement": raw.rstrip(),
-                            })
-                        elif re.match(r"^\$\([A-Za-z0-9_]+\).*$", resolved):
-                            # A dynamic $(var) expression—OK
-                            pass
-                        else:
-                            warnings.append({
-                                "line": line_no,
-                                "issue": f"Parameter '{param_name}' passed via expression '{resolved}'. Verify path conforms to rules.",
-                                "statement": raw.rstrip(),
-                            })
-                else:
-                    warnings.append({
-                        "line": line_no,
-                        "issue": f"Unable to resolve variable '{var_name}' passed to parameter '{param_name}'.",
-                        "statement": raw.rstrip(),
-                    })
+            # variable (unresolved allowed)
+            if (var := re.match(r"^([A-Za-z_]\w*)$", arg)):
+                res = _resolve_chain(var.group(1), assigns, set())
+                if res:
+                    if (lit := re.match(r"^'(.*)'$", res)):
+                        vv = lit.group(1).strip()
+                        if not (vv.lower().startswith("lib://") or re.match(r"^\$\([A-Za-z0-9_]+\)", vv)):
+                            warn(idx, f"Hard-coded literal '{vv}' (via var) passed to '{param}'.", ln)
+                    elif res.lower().startswith("lib://"):
+                        warn(idx, f"Hard-coded lib path '{res}' passed to '{param}'.", ln)
+                    elif not re.match(r"^\$\([A-Za-z0-9_]+\)", res):
+                        warn(idx, f"Unverified expression '{res}' passed to '{param}'.", ln)
                 continue
 
-            # Case C: Complex expression—prompt manual review
-            warnings.append({
-                "line": line_no,
-                "issue": f"Parameter '{param_name}' received complex expression '{arg}'. Verify path conforms to rules.",
-                "statement": raw.rstrip(),
-            })
+            # anything else
+            warn(idx, f"Complex expression '{arg}' passed to '{param}'.", ln)
 
-    # -------------------------------------------------------------------------
-    # 6) Independently scan all lines for any “LOAD … FROM … .qvd” even across multiple lines,
-    #    and flag if the entire block lies outside valid SUB ranges.
-    # -------------------------------------------------------------------------
-    load_select_pattern = re.compile(r"^\s*(LOAD|SELECT)\b", flags=re.IGNORECASE)
-    multi_from_qvd_pattern = re.compile(r"\bFROM\b.*\.qvd", flags=re.IGNORECASE)
+    # 5) flag outer LOAD … (qvd)
+    load_start_rx = re.compile(r"^\s*(CONCATENATE\s*\([^)]*\)\s*)?LOAD\b", re.I)
 
-    if sub_ranges_with_qvd:
-        idx = 0
-        while idx < total_lines:
-            raw = lines[idx]
-            if load_select_pattern.match(raw):
-                block_start = idx
-                block_lines = [raw.rstrip()]
-                j = idx + 1
-                found_semicolon = raw.rstrip().endswith(";")
-                while j < total_lines and not found_semicolon:
-                    next_line = lines[j].rstrip()
-                    block_lines.append(next_line)
-                    if next_line.endswith(";"):
-                        found_semicolon = True
-                    j += 1
+    i = 0
+    while i < len(lines):
+        if not load_start_rx.match(lines[i]):
+            i += 1
+            continue
+        start = i
+        block, i = [lines[i]], i + 1
+        while i < len(lines) and not lines[i].rstrip().endswith(";"):
+            block.append(lines[i])
+            i += 1
+        if i < len(lines):
+            block.append(lines[i])
 
-                full_block = " ".join(block_lines)
-                if multi_from_qvd_pattern.search(full_block):
-                    inside_valid = False
-                    for (start, end) in sub_ranges_with_qvd:
-                        if start <= block_start <= end:
-                            inside_valid = True
-                            break
-                    if not inside_valid:
-                        warnings.append({
-                            "line": block_start + 1,
-                            "issue": "LOAD … FROM … qvd appears outside any SUB that contains QVD logic.",
-                            "statement": full_block,
-                        })
-                idx = j
-                continue
-            idx += 1
+        full = " ".join(block)
+        if qvd_load_rx.search(full) and not any(s <= start <= e for s, e in verifier_ranges):
+            warn(start, "LOAD … (qvd) outside any QVD-verifying SUB.", full)
+        i += 1
 
     return warnings
